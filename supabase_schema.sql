@@ -38,3 +38,4 @@ CREATE POLICY "Allow public insert and update on contacts"
   TO anon, authenticated
   USING (true)
   WITH CHECK (true);
+

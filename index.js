@@ -7,12 +7,15 @@ require('dotenv').config();
 const { fetchGoogleSheetData } = require('./googleSheets');
 const {
   isSupabaseConfigured,
-  getSupabaseConfig,
-  syncContactsToSupabase,
-  markContactSentInSupabase,
-  resetSentStatusInSupabase,
-  fetchContactsFromSupabase
+  getSupabaseConfig
 } = require('./supabaseClient');
+const {
+  getDatabaseStatus,
+  syncContactsToDatabase,
+  markContactSentInDatabase,
+  resetSentStatusInDatabase,
+  fetchContactsFromDatabase
+} = require('./dbClient');
 
 const app = express();
 const PORT = process.env.PORT || 1212;
@@ -76,6 +79,7 @@ function loadConfig() {
     defaultTemplate: 'welcome',
     supabaseUrl: process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || '',
     supabaseAnonKey: process.env.SUPABASE_ANON_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '',
+    postgresUrl: process.env.POSTGRES_URL || process.env.DATABASE_URL || '',
     templates: {
       welcome: {
         title: 'Welcome Offer',
@@ -201,10 +205,8 @@ async function initializeData() {
       };
       console.log(`Successfully synced ${res.totalCount} leads from Google Sheet!`);
 
-      // Permanently store ONLY Name and Phone in Supabase (if configured)
-      if (isSupabaseConfigured()) {
-        syncContactsToSupabase(currentLeads);
-      }
+      // Permanently store ONLY Name and Phone in DB (Vercel Postgres or Supabase)
+      await syncContactsToDatabase(currentLeads);
       return;
     } catch (err) {
       console.error(`Could not sync Google Sheet on startup: ${err.message}`);
@@ -222,10 +224,8 @@ async function initializeData() {
     currentLeads = records.map((row, idx) => normalizeLeadRow(row, idx));
     sheetStatus.headers = Object.keys(records[0] || {});
 
-    // Sync sample contact names & phones to Supabase if active
-    if (isSupabaseConfigured()) {
-      syncContactsToSupabase(currentLeads);
-    }
+    // Sync sample contact names & phones to active DB if available
+    await syncContactsToDatabase(currentLeads);
   } catch (err) {
     currentLeads = [
       { id: 1, name: 'Rohit Sharma', phone: '+91 98765 43210', group: 'VIP', orderId: 'ORD-101', status: 'Out for delivery', time: '3:00 PM', variables: { name: 'Rohit Sharma', phone: '+91 98765 43210', group: 'VIP', orderId: 'ORD-101', status: 'Out for delivery', time: '3:00 PM' } },
@@ -260,10 +260,8 @@ app.post('/api/sheet/connect', async (req, res) => {
       headers: data.headers
     };
 
-    // Permanently sync Name and Phone to Supabase
-    if (isSupabaseConfigured()) {
-      await syncContactsToSupabase(currentLeads);
-    }
+    // Permanently sync Name and Phone to Database (Vercel Postgres or Supabase)
+    await syncContactsToDatabase(currentLeads);
 
     res.json({
       success: true,
@@ -299,10 +297,8 @@ app.post('/api/sheet/sync', async (req, res) => {
       headers: data.headers
     };
 
-    // Permanently sync Name and Phone to Supabase
-    if (isSupabaseConfigured()) {
-      await syncContactsToSupabase(currentLeads);
-    }
+    // Permanently sync Name and Phone to Database
+    await syncContactsToDatabase(currentLeads);
 
     res.json({
       success: true,
@@ -321,7 +317,7 @@ app.post('/api/sheet/sync', async (req, res) => {
   }
 });
 
-// Get state (leads, templates, groups, status, Supabase config)
+// Get state (leads, templates, groups, status, Database status)
 app.get('/api/state', (req, res) => {
   res.json({
     sheetStatus,
@@ -330,7 +326,8 @@ app.get('/api/state', (req, res) => {
     templates: appConfig.templates, // ephemeral / session only
     defaultTemplate: appConfig.defaultTemplate || Object.keys(appConfig.templates)[0] || 'welcome',
     defaultCountryCode: appConfig.defaultCountryCode,
-    supabaseConfig: getSupabaseConfig()
+    supabaseConfig: getSupabaseConfig(),
+    dbStatus: getDatabaseStatus()
   });
 });
 
@@ -345,33 +342,36 @@ app.post('/api/supabase/config', async (req, res) => {
   appConfig.supabaseAnonKey = anonKey.trim();
   saveConfig(appConfig);
 
-  // Update process.env for current process
   process.env.SUPABASE_URL = appConfig.supabaseUrl;
   process.env.SUPABASE_ANON_KEY = appConfig.supabaseAnonKey;
 
-  // Sync current contacts (Name & Phone only) to Supabase
-  let syncResult = { count: 0 };
-  try {
-    const { createClient } = require('@supabase/supabase-js');
-    const sb = createClient(appConfig.supabaseUrl, appConfig.supabaseAnonKey);
-    const records = currentLeads.filter(l => l.phone).map(l => ({
-      name: l.name || 'Unknown',
-      phone: String(l.phone).replace(/\D/g, ''),
-      group_name: l.group || 'General',
-      is_sent: !!l.isSent
-    }));
-    if (records.length > 0) {
-      const { data, error } = await sb.from('contacts').upsert(records, { onConflict: 'phone' });
-      if (!error) syncResult.count = records.length;
-    }
-  } catch (err) {
-    console.error('Supabase test connect error:', err.message);
-  }
+  const syncResult = await syncContactsToDatabase(currentLeads);
 
   res.json({
     success: true,
-    message: `Supabase configured! Synced ${syncResult.count} contacts permanently.`,
-    supabaseConfig: { isConfigured: true, url: appConfig.supabaseUrl, anonKey: appConfig.supabaseAnonKey }
+    message: `Supabase configured! Synced ${syncResult.count || 0} contacts permanently.`,
+    supabaseConfig: { isConfigured: true, url: appConfig.supabaseUrl, anonKey: appConfig.supabaseAnonKey },
+    dbStatus: getDatabaseStatus()
+  });
+});
+
+// Configure Vercel Postgres connection URL
+app.post('/api/postgres/config', async (req, res) => {
+  const { postgresUrl } = req.body;
+  if (!postgresUrl) {
+    return res.status(400).json({ error: 'Postgres connection string is required.' });
+  }
+
+  appConfig.postgresUrl = postgresUrl.trim();
+  saveConfig(appConfig);
+  process.env.POSTGRES_URL = appConfig.postgresUrl;
+
+  const syncResult = await syncContactsToDatabase(currentLeads);
+
+  res.json({
+    success: true,
+    message: `Vercel Postgres connected! Synced ${syncResult.count || 0} contacts permanently.`,
+    dbStatus: getDatabaseStatus()
   });
 });
 
@@ -418,7 +418,7 @@ app.post('/api/upload-media', upload.single('mediaFile'), (req, res) => {
   });
 });
 
-// Save single template (Temporary/Session only - NOT stored in Supabase)
+// Save single template (Temporary/Session only - NOT stored in Database)
 app.post('/api/templates/save-single', (req, res) => {
   const { key, title, text, mediaUrl, mediaType } = req.body;
   if (!key || !text) {
@@ -457,7 +457,7 @@ app.post('/api/set-default-template', (req, res) => {
   res.json({ success: true, defaultTemplate: appConfig.defaultTemplate });
 });
 
-// Mark lead as sent (updates Supabase Realtime if configured)
+// Mark lead as sent (updates permanent Database if configured)
 app.post('/api/leads/mark-sent', async (req, res) => {
   const { id } = req.body;
   if (id != null) {
@@ -465,9 +465,7 @@ app.post('/api/leads/mark-sent', async (req, res) => {
     const lead = currentLeads.find(l => l.id === Number(id));
     if (lead && lead.phone) {
       const clean = cleanPhoneNumber(lead.phone);
-      if (isSupabaseConfigured()) {
-        await markContactSentInSupabase(clean);
-      }
+      await markContactSentInDatabase(clean);
     }
   }
   res.json({ success: true, sentIds: Array.from(sentLeadIds) });
@@ -476,9 +474,7 @@ app.post('/api/leads/mark-sent', async (req, res) => {
 // Reset sent status
 app.post('/api/leads/reset-sent', async (req, res) => {
   sentLeadIds.clear();
-  if (isSupabaseConfigured()) {
-    await resetSentStatusInSupabase();
-  }
+  await resetSentStatusInDatabase();
   res.json({ success: true });
 });
 
@@ -495,8 +491,7 @@ app.get('/', (req, res) => {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>WhatsApp Automation Dispatcher • Google Sheets & Realtime</title>
-  <!-- Supabase Realtime Client -->
+  <title>WhatsApp Automation Dispatcher • Google Sheets & Cloud DB</title>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <style>
     :root {
@@ -882,12 +877,12 @@ app.get('/', (req, res) => {
         <div class="logo">💬</div>
         <div>
           <h1>WhatsApp Automation Dispatcher</h1>
-          <p class="subtitle">Google Sheets &bull; Permanent Contacts Sync &bull; Ephemeral Media Templates</p>
+          <p class="subtitle">Google Sheets &bull; Permanent Contacts (Vercel Postgres &amp; Supabase) &bull; Ephemeral Media Templates</p>
         </div>
       </div>
       <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-        <button class="btn btn-secondary btn-sm" id="supabaseBtn" onclick="openSupabaseModal()">
-          <span id="supabaseIcon">⚡</span> <span id="supabaseStatusText">Supabase Sync</span>
+        <button class="btn btn-secondary btn-sm" id="dbBtn" onclick="openDatabaseModal()">
+          <span id="dbIcon">☁️</span> <span id="dbStatusText">Cloud Database</span>
         </button>
         <button class="btn btn-secondary btn-sm" onclick="openTemplatesModal()">🎨 Template & Media Manager</button>
         <a href="/api/download-sample" class="btn btn-secondary btn-sm">📥 Sample CSV</a>
@@ -986,7 +981,7 @@ app.get('/', (req, res) => {
         <button class="tab-btn" onclick="setFilter('sent', this)">Sent</button>
       </div>
 
-      <div style="display: flex; gap: 8px; flex-1; max-width: 420px;">
+      <div style="display: flex; gap: 8px; flex: 1; max-width: 420px;">
         <input type="search" id="searchInput" oninput="renderTable()" placeholder="Search name, phone, order ID..." />
         <button class="btn btn-secondary btn-sm" onclick="resetSentStatus()" title="Reset all Sent statuses">Reset Sent</button>
       </div>
@@ -1046,48 +1041,49 @@ app.get('/', (req, res) => {
     </div>
   </div>
 
-  <!-- MODAL: Supabase Realtime Settings -->
-  <div id="supabaseModal" class="modal-backdrop">
+  <!-- MODAL: Cloud Database Settings (Vercel Postgres & Supabase) -->
+  <div id="dbModal" class="modal-backdrop">
     <div class="modal">
       <div class="modal-header">
-        <div class="modal-title">⚡ Supabase Realtime Sync</div>
-        <button class="close-btn" onclick="closeSupabaseModal()">&times;</button>
+        <div class="modal-title">☁️ Cloud Database Storage</div>
+        <button class="close-btn" onclick="closeDatabaseModal()">&times;</button>
       </div>
       <div class="modal-body">
-        <p style="font-size: 13px; color: #555; margin-bottom: 12px; line-height: 1.5;">
-          <strong>Privacy Rule Active</strong>: Only <strong>Contact Name & Phone</strong> are permanently saved in Supabase. Message text and templates remain temporary in browser/session.
+        <p style="font-size: 13px; color: #555; margin-bottom: 14px; line-height: 1.5;">
+          <strong>Privacy Rule Enforced:</strong> Only <strong>Contact Name &amp; Phone</strong> are stored permanently in the database. Templates and message text are temporary.
         </p>
 
-        <div style="margin-bottom: 12px;">
-          <label style="font-weight: 600; font-size: 12px; text-transform: uppercase;">Supabase Project URL</label>
-          <input type="text" id="sbUrlInput" placeholder="https://your-project.supabase.co" style="margin-top: 4px;" />
+        <!-- Option 1: Vercel Postgres -->
+        <div style="background: #F8FAFC; border: 1.5px solid #E2E8F0; padding: 14px; border-radius: 8px; margin-bottom: 16px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+            <strong style="font-size: 13px;">▲ Vercel Postgres (Neon)</strong>
+            <span style="font-size: 11px; background: #000; color: #fff; padding: 2px 7px; border-radius: 4px;">Recommended</span>
+          </div>
+          <p style="font-size: 12px; color: #666; margin-bottom: 8px;">
+            When deployed to Vercel, this connects automatically via <code>POSTGRES_URL</code>. Or paste your connection string below:
+          </p>
+          <input type="text" id="postgresUrlInput" placeholder="postgres://default:...@...neon.tech:5432/verceldb?sslmode=require" style="font-size: 12px;" />
+          <button class="btn btn-secondary btn-sm" style="margin-top: 8px;" onclick="savePostgresUrl()">Connect Vercel Postgres</button>
         </div>
 
-        <div style="margin-bottom: 14px;">
-          <label style="font-weight: 600; font-size: 12px; text-transform: uppercase;">Supabase Anon / API Key</label>
-          <input type="text" id="sbKeyInput" placeholder="eyJhbGciOi..." style="margin-top: 4px;" />
+        <!-- Option 2: Supabase -->
+        <div style="background: #F8FAFC; border: 1.5px solid #E2E8F0; padding: 14px; border-radius: 8px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+            <strong style="font-size: 13px;">⚡ Supabase Database (Realtime Sync)</strong>
+          </div>
+          <div style="margin-bottom: 8px;">
+            <label style="font-size: 11px; font-weight: 600;">Supabase URL</label>
+            <input type="text" id="sbUrlInput" placeholder="https://your-project.supabase.co" style="margin-top: 2px; font-size: 12px;" />
+          </div>
+          <div style="margin-bottom: 8px;">
+            <label style="font-size: 11px; font-weight: 600;">Anon / Public Key</label>
+            <input type="text" id="sbKeyInput" placeholder="eyJhbGciOi..." style="margin-top: 2px; font-size: 12px;" />
+          </div>
+          <button class="btn btn-secondary btn-sm" onclick="saveSupabaseSettings()">Connect Supabase</button>
         </div>
 
-        <div style="background: #F8FAFC; border: 1px dashed #CBD5E1; padding: 12px; border-radius: 8px; font-size: 12px; line-height: 1.6; margin-bottom: 14px;">
-          <strong>SQL Setup in Supabase:</strong>
-          Run this in Supabase SQL Editor once to create the table:
-          <pre style="background: #E2E8F0; padding: 8px; border-radius: 6px; margin-top: 6px; overflow-x: auto; font-size: 11px;">
-CREATE TABLE public.contacts (
-  id BIGSERIAL PRIMARY KEY,
-  name TEXT NOT NULL,
-  phone TEXT UNIQUE NOT NULL,
-  group_name TEXT DEFAULT 'General',
-  is_sent BOOLEAN DEFAULT FALSE,
-  last_sent_at TIMESTAMPTZ,
-  updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-ALTER PUBLICATION supabase_realtime ADD TABLE public.contacts;
-          </pre>
-        </div>
-
-        <div style="display: flex; justify-content: flex-end; gap: 8px;">
-          <button class="btn btn-secondary btn-sm" onclick="closeSupabaseModal()">Cancel</button>
-          <button class="btn btn-primary btn-sm" onclick="saveSupabaseSettings()">Save & Connect</button>
+        <div style="display: flex; justify-content: flex-end; margin-top: 14px;">
+          <button class="btn btn-primary btn-sm" onclick="closeDatabaseModal()">Close</button>
         </div>
       </div>
     </div>
@@ -1174,7 +1170,8 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.contacts;
       sheetStatus: {},
       activeFilter: 'all',
       defaultCountryCode: '91',
-      supabaseConfig: { isConfigured: false, url: '', anonKey: '' }
+      supabaseConfig: { isConfigured: false, url: '', anonKey: '' },
+      dbStatus: { provider: 'local', name: 'Local Mode', isConnected: false }
     };
 
     let supabaseClient = null;
@@ -1589,19 +1586,44 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.contacts;
       showToast('Copied ' + numbers.length + ' phone numbers to clipboard!');
     }
 
-    // --- MODAL: SUPABASE REALTIME SETTINGS ---
-    function openSupabaseModal() {
+    // --- MODAL: DATABASE SETTINGS ---
+    function openDatabaseModal() {
       if (state.supabaseConfig.url) {
         document.getElementById('sbUrlInput').value = state.supabaseConfig.url;
       }
       if (state.supabaseConfig.anonKey) {
         document.getElementById('sbKeyInput').value = state.supabaseConfig.anonKey;
       }
-      document.getElementById('supabaseModal').classList.add('open');
+      document.getElementById('dbModal').classList.add('open');
     }
 
-    function closeSupabaseModal() {
-      document.getElementById('supabaseModal').classList.remove('open');
+    function closeDatabaseModal() {
+      document.getElementById('dbModal').classList.remove('open');
+    }
+
+    async function savePostgresUrl() {
+      const postgresUrl = document.getElementById('postgresUrlInput').value.trim();
+      if (!postgresUrl) {
+        alert('Please enter a PostgreSQL connection string.');
+        return;
+      }
+
+      try {
+        const res = await fetch('/api/postgres/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ postgresUrl })
+        });
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error || 'Connection failed');
+
+        state.dbStatus = data.dbStatus;
+        updateDbButton();
+        closeDatabaseModal();
+        showToast(data.message);
+      } catch (err) {
+        alert('Vercel Postgres error: ' + err.message);
+      }
     }
 
     async function saveSupabaseSettings() {
@@ -1623,7 +1645,9 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.contacts;
         if (!data.success) throw new Error(data.error || 'Failed to connect');
 
         state.supabaseConfig = data.supabaseConfig;
-        closeSupabaseModal();
+        state.dbStatus = data.dbStatus;
+        updateDbButton();
+        closeDatabaseModal();
         initSupabaseRealtime();
         showToast(data.message);
       } catch (err) {
@@ -1631,18 +1655,25 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.contacts;
       }
     }
 
-    function initSupabaseRealtime() {
-      const statusText = document.getElementById('supabaseStatusText');
-      const icon = document.getElementById('supabaseIcon');
+    function updateDbButton() {
+      const btnText = document.getElementById('dbStatusText');
+      const icon = document.getElementById('dbIcon');
+      const db = state.dbStatus || {};
 
-      if (!state.supabaseConfig.isConfigured || !window.supabase) {
-        statusText.innerText = 'Connect Supabase';
-        icon.innerText = '⚙️';
-        return;
+      if (db.provider === 'vercel_postgres') {
+        btnText.innerText = 'Vercel Postgres Active';
+        icon.innerText = '▲';
+      } else if (db.provider === 'supabase') {
+        btnText.innerText = 'Supabase Realtime';
+        icon.innerText = '⚡';
+      } else {
+        btnText.innerText = 'Connect Cloud DB';
+        icon.innerText = '☁️';
       }
+    }
 
-      statusText.innerText = 'Supabase Realtime';
-      icon.innerText = '⚡';
+    function initSupabaseRealtime() {
+      if (!state.supabaseConfig.isConfigured || !window.supabase) return;
 
       try {
         supabaseClient = window.supabase.createClient(
@@ -1650,7 +1681,6 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.contacts;
           state.supabaseConfig.anonKey
         );
 
-        // Listen for Realtime live updates on 'contacts' table
         supabaseClient
           .channel('public:contacts')
           .on('postgres_changes', { event: '*', schema: 'public', table: 'contacts' }, payload => {
@@ -1665,10 +1695,8 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.contacts;
             }
           })
           .subscribe();
-
-        console.log('⚡ Supabase Realtime subscribed to table: contacts');
       } catch (err) {
-        console.warn('Could not initialize Supabase Realtime in browser:', err);
+        console.warn('Supabase Realtime notice:', err);
       }
     }
 
@@ -1852,12 +1880,14 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.contacts;
         state.globalTemplate = data.defaultTemplate || Object.keys(data.templates)[0] || 'welcome';
         state.defaultCountryCode = data.defaultCountryCode || '91';
         state.supabaseConfig = data.supabaseConfig || { isConfigured: false, url: '', anonKey: '' };
+        state.dbStatus = data.dbStatus || { provider: 'local', name: 'Local Mode', isConnected: false };
 
         if (state.sheetStatus.sheetUrl) {
           document.getElementById('sheetUrlInput').value = state.sheetStatus.sheetUrl;
         }
 
         updateBadge();
+        updateDbButton();
         renderGroupDropdown();
         renderGlobalTemplateDropdown();
         updateStats();
@@ -1876,9 +1906,15 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.contacts;
   `);
 });
 
-// Start server
-initializeData().then(() => {
-  app.listen(PORT, () => {
-    console.log(`WhatsApp Automation Server running on http://localhost:${PORT}`);
+// Start server for local development or export for Vercel
+if (!process.env.VERCEL) {
+  initializeData().then(() => {
+    app.listen(PORT, () => {
+      console.log(`WhatsApp Automation Server running on http://localhost:${PORT}`);
+    });
   });
-});
+} else {
+  initializeData();
+}
+
+module.exports = app;
