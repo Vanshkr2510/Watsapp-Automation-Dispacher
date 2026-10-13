@@ -5,6 +5,14 @@ const multer = require('multer');
 require('dotenv').config();
 
 const { fetchGoogleSheetData } = require('./googleSheets');
+const {
+  isSupabaseConfigured,
+  getSupabaseConfig,
+  syncContactsToSupabase,
+  markContactSentInSupabase,
+  resetSentStatusInSupabase,
+  fetchContactsFromSupabase
+} = require('./supabaseClient');
 
 const app = express();
 const PORT = process.env.PORT || 1212;
@@ -33,7 +41,7 @@ const upload = multer({
 app.use(express.json());
 app.use('/uploads', express.static(UPLOADS_DIR));
 
-// Helper: Normalize templates
+// Helper: Normalize templates (Temporary / Ephemeral in memory)
 function normalizeTemplates(rawTemplates) {
   const result = {};
   for (const [key, val] of Object.entries(rawTemplates || {})) {
@@ -66,6 +74,8 @@ function loadConfig() {
     sheetUrl: process.env.GOOGLE_SHEET_URL || '',
     defaultCountryCode: process.env.DEFAULT_COUNTRY_CODE || '91',
     defaultTemplate: 'welcome',
+    supabaseUrl: process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || '',
+    supabaseAnonKey: process.env.SUPABASE_ANON_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '',
     templates: {
       welcome: {
         title: 'Welcome Offer',
@@ -190,6 +200,11 @@ async function initializeData() {
         headers: res.headers
       };
       console.log(`Successfully synced ${res.totalCount} leads from Google Sheet!`);
+
+      // Permanently store ONLY Name and Phone in Supabase (if configured)
+      if (isSupabaseConfigured()) {
+        syncContactsToSupabase(currentLeads);
+      }
       return;
     } catch (err) {
       console.error(`Could not sync Google Sheet on startup: ${err.message}`);
@@ -206,6 +221,11 @@ async function initializeData() {
     const records = parse(sampleContent, { columns: true, skip_empty_lines: true, trim: true });
     currentLeads = records.map((row, idx) => normalizeLeadRow(row, idx));
     sheetStatus.headers = Object.keys(records[0] || {});
+
+    // Sync sample contact names & phones to Supabase if active
+    if (isSupabaseConfigured()) {
+      syncContactsToSupabase(currentLeads);
+    }
   } catch (err) {
     currentLeads = [
       { id: 1, name: 'Rohit Sharma', phone: '+91 98765 43210', group: 'VIP', orderId: 'ORD-101', status: 'Out for delivery', time: '3:00 PM', variables: { name: 'Rohit Sharma', phone: '+91 98765 43210', group: 'VIP', orderId: 'ORD-101', status: 'Out for delivery', time: '3:00 PM' } },
@@ -240,9 +260,14 @@ app.post('/api/sheet/connect', async (req, res) => {
       headers: data.headers
     };
 
+    // Permanently sync Name and Phone to Supabase
+    if (isSupabaseConfigured()) {
+      await syncContactsToSupabase(currentLeads);
+    }
+
     res.json({
       success: true,
-      message: `Successfully connected Google Sheet! Loaded ${data.totalCount} leads across ${getGroupsSummary(currentLeads).length - 1} groups.`,
+      message: `Successfully connected Google Sheet! Loaded ${data.totalCount} contacts across ${getGroupsSummary(currentLeads).length - 1} groups.`,
       sheetStatus,
       leads: currentLeads,
       groups: getGroupsSummary(currentLeads),
@@ -274,9 +299,14 @@ app.post('/api/sheet/sync', async (req, res) => {
       headers: data.headers
     };
 
+    // Permanently sync Name and Phone to Supabase
+    if (isSupabaseConfigured()) {
+      await syncContactsToSupabase(currentLeads);
+    }
+
     res.json({
       success: true,
-      message: `Synced ${data.totalCount} leads successfully!`,
+      message: `Synced ${data.totalCount} contacts successfully!`,
       sheetStatus,
       leads: currentLeads,
       groups: getGroupsSummary(currentLeads),
@@ -291,15 +321,57 @@ app.post('/api/sheet/sync', async (req, res) => {
   }
 });
 
-// Get state (leads, templates, groups, status)
+// Get state (leads, templates, groups, status, Supabase config)
 app.get('/api/state', (req, res) => {
   res.json({
     sheetStatus,
     leads: currentLeads.map(l => ({ ...l, isSent: sentLeadIds.has(l.id) })),
     groups: getGroupsSummary(currentLeads),
-    templates: appConfig.templates,
+    templates: appConfig.templates, // ephemeral / session only
     defaultTemplate: appConfig.defaultTemplate || Object.keys(appConfig.templates)[0] || 'welcome',
-    defaultCountryCode: appConfig.defaultCountryCode
+    defaultCountryCode: appConfig.defaultCountryCode,
+    supabaseConfig: getSupabaseConfig()
+  });
+});
+
+// Configure Supabase credentials
+app.post('/api/supabase/config', async (req, res) => {
+  const { url, anonKey } = req.body;
+  if (!url || !anonKey) {
+    return res.status(400).json({ error: 'Supabase URL and Anon Key are required.' });
+  }
+
+  appConfig.supabaseUrl = url.trim();
+  appConfig.supabaseAnonKey = anonKey.trim();
+  saveConfig(appConfig);
+
+  // Update process.env for current process
+  process.env.SUPABASE_URL = appConfig.supabaseUrl;
+  process.env.SUPABASE_ANON_KEY = appConfig.supabaseAnonKey;
+
+  // Sync current contacts (Name & Phone only) to Supabase
+  let syncResult = { count: 0 };
+  try {
+    const { createClient } = require('@supabase/supabase-js');
+    const sb = createClient(appConfig.supabaseUrl, appConfig.supabaseAnonKey);
+    const records = currentLeads.filter(l => l.phone).map(l => ({
+      name: l.name || 'Unknown',
+      phone: String(l.phone).replace(/\D/g, ''),
+      group_name: l.group || 'General',
+      is_sent: !!l.isSent
+    }));
+    if (records.length > 0) {
+      const { data, error } = await sb.from('contacts').upsert(records, { onConflict: 'phone' });
+      if (!error) syncResult.count = records.length;
+    }
+  } catch (err) {
+    console.error('Supabase test connect error:', err.message);
+  }
+
+  res.json({
+    success: true,
+    message: `Supabase configured! Synced ${syncResult.count} contacts permanently.`,
+    supabaseConfig: { isConfigured: true, url: appConfig.supabaseUrl, anonKey: appConfig.supabaseAnonKey }
   });
 });
 
@@ -346,7 +418,7 @@ app.post('/api/upload-media', upload.single('mediaFile'), (req, res) => {
   });
 });
 
-// Save single template (add or update)
+// Save single template (Temporary/Session only - NOT stored in Supabase)
 app.post('/api/templates/save-single', (req, res) => {
   const { key, title, text, mediaUrl, mediaType } = req.body;
   if (!key || !text) {
@@ -365,7 +437,7 @@ app.post('/api/templates/save-single', (req, res) => {
   res.json({ success: true, key: cleanKey, template: appConfig.templates[cleanKey], templates: appConfig.templates });
 });
 
-// Delete template
+// Delete template (Temporary/Session only)
 app.delete('/api/templates/:key', (req, res) => {
   const { key } = req.params;
   if (appConfig.templates[key]) {
@@ -385,18 +457,28 @@ app.post('/api/set-default-template', (req, res) => {
   res.json({ success: true, defaultTemplate: appConfig.defaultTemplate });
 });
 
-// Mark lead as sent
-app.post('/api/leads/mark-sent', (req, res) => {
+// Mark lead as sent (updates Supabase Realtime if configured)
+app.post('/api/leads/mark-sent', async (req, res) => {
   const { id } = req.body;
   if (id != null) {
     sentLeadIds.add(Number(id));
+    const lead = currentLeads.find(l => l.id === Number(id));
+    if (lead && lead.phone) {
+      const clean = cleanPhoneNumber(lead.phone);
+      if (isSupabaseConfigured()) {
+        await markContactSentInSupabase(clean);
+      }
+    }
   }
   res.json({ success: true, sentIds: Array.from(sentLeadIds) });
 });
 
 // Reset sent status
-app.post('/api/leads/reset-sent', (req, res) => {
+app.post('/api/leads/reset-sent', async (req, res) => {
   sentLeadIds.clear();
+  if (isSupabaseConfigured()) {
+    await resetSentStatusInSupabase();
+  }
   res.json({ success: true });
 });
 
@@ -413,7 +495,9 @@ app.get('/', (req, res) => {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>WhatsApp Automation Dispatcher • Google Sheets</title>
+  <title>WhatsApp Automation Dispatcher • Google Sheets & Realtime</title>
+  <!-- Supabase Realtime Client -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <style>
     :root {
       --primary: #25D366;
@@ -530,11 +614,7 @@ app.get('/', (req, res) => {
     @media (max-width: 820px) {
       .campaign-control-grid { grid-template-columns: 1fr; }
     }
-    .step-box {
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    }
+    .step-box { display: flex; flex-direction: column; gap: 6px; }
     .step-label {
       font-size: 12px;
       font-weight: 700;
@@ -557,7 +637,6 @@ app.get('/', (req, res) => {
     }
     select:focus { border-color: var(--primary); }
 
-    /* Media badge */
     .media-indicator {
       display: inline-flex;
       align-items: center;
@@ -803,10 +882,13 @@ app.get('/', (req, res) => {
         <div class="logo">💬</div>
         <div>
           <h1>WhatsApp Automation Dispatcher</h1>
-          <p class="subtitle">Google Sheets &bull; Contact Groups &bull; Media Templates &bull; WhatsApp Web</p>
+          <p class="subtitle">Google Sheets &bull; Permanent Contacts Sync &bull; Ephemeral Media Templates</p>
         </div>
       </div>
       <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+        <button class="btn btn-secondary btn-sm" id="supabaseBtn" onclick="openSupabaseModal()">
+          <span id="supabaseIcon">⚡</span> <span id="supabaseStatusText">Supabase Sync</span>
+        </button>
         <button class="btn btn-secondary btn-sm" onclick="openTemplatesModal()">🎨 Template & Media Manager</button>
         <a href="/api/download-sample" class="btn btn-secondary btn-sm">📥 Sample CSV</a>
       </div>
@@ -904,7 +986,7 @@ app.get('/', (req, res) => {
         <button class="tab-btn" onclick="setFilter('sent', this)">Sent</button>
       </div>
 
-      <div style="display: flex; gap: 8px; flex: 1; max-width: 420px;">
+      <div style="display: flex; gap: 8px; flex-1; max-width: 420px;">
         <input type="search" id="searchInput" oninput="renderTable()" placeholder="Search name, phone, order ID..." />
         <button class="btn btn-secondary btn-sm" onclick="resetSentStatus()" title="Reset all Sent statuses">Reset Sent</button>
       </div>
@@ -964,6 +1046,53 @@ app.get('/', (req, res) => {
     </div>
   </div>
 
+  <!-- MODAL: Supabase Realtime Settings -->
+  <div id="supabaseModal" class="modal-backdrop">
+    <div class="modal">
+      <div class="modal-header">
+        <div class="modal-title">⚡ Supabase Realtime Sync</div>
+        <button class="close-btn" onclick="closeSupabaseModal()">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p style="font-size: 13px; color: #555; margin-bottom: 12px; line-height: 1.5;">
+          <strong>Privacy Rule Active</strong>: Only <strong>Contact Name & Phone</strong> are permanently saved in Supabase. Message text and templates remain temporary in browser/session.
+        </p>
+
+        <div style="margin-bottom: 12px;">
+          <label style="font-weight: 600; font-size: 12px; text-transform: uppercase;">Supabase Project URL</label>
+          <input type="text" id="sbUrlInput" placeholder="https://your-project.supabase.co" style="margin-top: 4px;" />
+        </div>
+
+        <div style="margin-bottom: 14px;">
+          <label style="font-weight: 600; font-size: 12px; text-transform: uppercase;">Supabase Anon / API Key</label>
+          <input type="text" id="sbKeyInput" placeholder="eyJhbGciOi..." style="margin-top: 4px;" />
+        </div>
+
+        <div style="background: #F8FAFC; border: 1px dashed #CBD5E1; padding: 12px; border-radius: 8px; font-size: 12px; line-height: 1.6; margin-bottom: 14px;">
+          <strong>SQL Setup in Supabase:</strong>
+          Run this in Supabase SQL Editor once to create the table:
+          <pre style="background: #E2E8F0; padding: 8px; border-radius: 6px; margin-top: 6px; overflow-x: auto; font-size: 11px;">
+CREATE TABLE public.contacts (
+  id BIGSERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  phone TEXT UNIQUE NOT NULL,
+  group_name TEXT DEFAULT 'General',
+  is_sent BOOLEAN DEFAULT FALSE,
+  last_sent_at TIMESTAMPTZ,
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+ALTER PUBLICATION supabase_realtime ADD TABLE public.contacts;
+          </pre>
+        </div>
+
+        <div style="display: flex; justify-content: flex-end; gap: 8px;">
+          <button class="btn btn-secondary btn-sm" onclick="closeSupabaseModal()">Cancel</button>
+          <button class="btn btn-primary btn-sm" onclick="saveSupabaseSettings()">Save & Connect</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- MODAL: Template & Media Manager -->
   <div id="templatesModal" class="modal-backdrop">
     <div class="modal">
@@ -974,7 +1103,7 @@ app.get('/', (req, res) => {
 
       <div class="modal-body">
         <p style="font-size: 13px; color: #666; margin-bottom: 10px;">
-          Attach a <strong>Photo</strong> or <strong>Video</strong> (optional) and write personalized text.
+          Templates are <strong>temporary/session-based</strong> and NOT permanently saved to the database.
         </p>
 
         <!-- Template selector / Create new -->
@@ -1044,8 +1173,11 @@ app.get('/', (req, res) => {
       globalTemplate: 'welcome',
       sheetStatus: {},
       activeFilter: 'all',
-      defaultCountryCode: '91'
+      defaultCountryCode: '91',
+      supabaseConfig: { isConfigured: false, url: '', anonKey: '' }
     };
+
+    let supabaseClient = null;
 
     function showToast(msg) {
       const toast = document.getElementById('toast');
@@ -1217,7 +1349,6 @@ app.get('/', (req, res) => {
           ? '<span class="badge-sent">✓ Sent</span>'
           : '<span class="badge-pending">⏳ Pending</span>';
 
-        // Media thumbnail
         let mediaHtml = '';
         if (tplObj.mediaUrl) {
           if (tplObj.mediaType === 'video') {
@@ -1294,13 +1425,10 @@ app.get('/', (req, res) => {
       try {
         const response = await fetch(imageUrl);
         const blob = await response.blob();
-        
-        // Convert to PNG blob if JPEG (ClipboardItem requires image/png in some browsers)
         let pngBlob = blob;
         if (blob.type !== 'image/png') {
           pngBlob = await convertBlobToPng(blob);
         }
-
         await navigator.clipboard.write([
           new ClipboardItem({ 'image/png': pngBlob })
         ]);
@@ -1374,7 +1502,6 @@ app.get('/', (req, res) => {
           body: JSON.stringify({ sheetUrl: url })
         });
         const data = await res.json();
-
         if (!res.ok || !data.success) throw new Error(data.error || 'Failed to connect sheet');
 
         state.sheetStatus = data.sheetStatus;
@@ -1462,6 +1589,89 @@ app.get('/', (req, res) => {
       showToast('Copied ' + numbers.length + ' phone numbers to clipboard!');
     }
 
+    // --- MODAL: SUPABASE REALTIME SETTINGS ---
+    function openSupabaseModal() {
+      if (state.supabaseConfig.url) {
+        document.getElementById('sbUrlInput').value = state.supabaseConfig.url;
+      }
+      if (state.supabaseConfig.anonKey) {
+        document.getElementById('sbKeyInput').value = state.supabaseConfig.anonKey;
+      }
+      document.getElementById('supabaseModal').classList.add('open');
+    }
+
+    function closeSupabaseModal() {
+      document.getElementById('supabaseModal').classList.remove('open');
+    }
+
+    async function saveSupabaseSettings() {
+      const url = document.getElementById('sbUrlInput').value.trim();
+      const anonKey = document.getElementById('sbKeyInput').value.trim();
+
+      if (!url || !anonKey) {
+        alert('Please enter both Supabase URL and Anon Key.');
+        return;
+      }
+
+      try {
+        const res = await fetch('/api/supabase/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url, anonKey })
+        });
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error || 'Failed to connect');
+
+        state.supabaseConfig = data.supabaseConfig;
+        closeSupabaseModal();
+        initSupabaseRealtime();
+        showToast(data.message);
+      } catch (err) {
+        alert('Supabase connection error: ' + err.message);
+      }
+    }
+
+    function initSupabaseRealtime() {
+      const statusText = document.getElementById('supabaseStatusText');
+      const icon = document.getElementById('supabaseIcon');
+
+      if (!state.supabaseConfig.isConfigured || !window.supabase) {
+        statusText.innerText = 'Connect Supabase';
+        icon.innerText = '⚙️';
+        return;
+      }
+
+      statusText.innerText = 'Supabase Realtime';
+      icon.innerText = '⚡';
+
+      try {
+        supabaseClient = window.supabase.createClient(
+          state.supabaseConfig.url,
+          state.supabaseConfig.anonKey
+        );
+
+        // Listen for Realtime live updates on 'contacts' table
+        supabaseClient
+          .channel('public:contacts')
+          .on('postgres_changes', { event: '*', schema: 'public', table: 'contacts' }, payload => {
+            console.log('⚡ Supabase Realtime update:', payload);
+            if (payload.new && payload.new.phone) {
+              const matched = state.leads.find(l => cleanPhone(l.phone) === payload.new.phone);
+              if (matched) {
+                matched.isSent = !!payload.new.is_sent;
+                updateStats();
+                renderTable();
+              }
+            }
+          })
+          .subscribe();
+
+        console.log('⚡ Supabase Realtime subscribed to table: contacts');
+      } catch (err) {
+        console.warn('Could not initialize Supabase Realtime in browser:', err);
+      }
+    }
+
     // --- MODAL: TEMPLATE & MEDIA MANAGER ---
     let editingTemplateKey = null;
 
@@ -1511,7 +1721,7 @@ app.get('/', (req, res) => {
       const tpl = state.templates[key] || { title: '', text: '', mediaUrl: '', mediaType: '' };
 
       document.getElementById('tplKeyInput').value = key;
-      document.getElementById('tplKeyInput').disabled = true; // don't change key on edit
+      document.getElementById('tplKeyInput').disabled = true;
       document.getElementById('tplTitleInput').value = tpl.title || '';
       document.getElementById('tplTextInput').value = tpl.text || '';
       document.getElementById('tplMediaUrlInput').value = tpl.mediaUrl || '';
@@ -1607,7 +1817,7 @@ app.get('/', (req, res) => {
         renderTemplateEditorPicker();
         renderTable();
         closeTemplatesModal();
-        showToast('Template saved successfully!');
+        showToast('Template saved for this session!');
       } catch (e) {
         alert('Error: ' + e.message);
       }
@@ -1641,6 +1851,7 @@ app.get('/', (req, res) => {
         state.templates = data.templates;
         state.globalTemplate = data.defaultTemplate || Object.keys(data.templates)[0] || 'welcome';
         state.defaultCountryCode = data.defaultCountryCode || '91';
+        state.supabaseConfig = data.supabaseConfig || { isConfigured: false, url: '', anonKey: '' };
 
         if (state.sheetStatus.sheetUrl) {
           document.getElementById('sheetUrlInput').value = state.sheetStatus.sheetUrl;
@@ -1652,6 +1863,7 @@ app.get('/', (req, res) => {
         updateStats();
         applyTemplateToAll(false);
         renderTable();
+        initSupabaseRealtime();
       } catch (e) {
         console.error('Failed to load initial state', e);
       }
