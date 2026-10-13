@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const multer = require('multer');
 require('dotenv').config();
+require('dotenv').config({ path: '.env.local' });
 
 const { fetchGoogleSheetData, fetchGoogleSheetTabs } = require('./googleSheets');
 const {
@@ -2074,10 +2075,9 @@ app.get('/', (req, res) => {
 
 // Start server for local development or export for Vercel
 if (!process.env.VERCEL) {
-  initializeData().then(() => {
-    app.listen(PORT, () => {
-      console.log(`WhatsApp Automation Server running on http://localhost:${PORT}`);
-    });
+  app.listen(PORT, () => {
+    console.log(`WhatsApp Automation Server running on http://localhost:${PORT}`);
+    initializeData();
   });
 } else {
   initializeData();

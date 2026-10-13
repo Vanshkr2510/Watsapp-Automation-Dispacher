@@ -1,5 +1,6 @@
 const { Pool } = require('pg');
 require('dotenv').config();
+require('dotenv').config({ path: '.env.local' });
 
 const {
   isSupabaseConfigured,
@@ -102,18 +103,29 @@ async function syncContactsToDatabase(leads) {
     if (validLeads.length === 0) return { synced: true, count: 0 };
 
     let successCount = 0;
-    for (const lead of validLeads) {
+    const chunkSize = 50;
+    for (let i = 0; i < validLeads.length; i += chunkSize) {
+      const chunk = validLeads.slice(i, i + chunkSize);
+      const valueClauses = [];
+      const values = [];
+      chunk.forEach((lead, idx) => {
+        const offset = idx * 4;
+        valueClauses.push(`($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, NOW())`);
+        values.push(lead.name, lead.phone, lead.group, lead.isSent);
+      });
+
+      const query = `
+        INSERT INTO contacts (name, phone, group_name, is_sent, updated_at)
+        VALUES ${valueClauses.join(', ')}
+        ON CONFLICT (phone) DO UPDATE
+        SET name = EXCLUDED.name, group_name = EXCLUDED.group_name, updated_at = NOW();
+      `;
+
       try {
-        const query = `
-          INSERT INTO contacts (name, phone, group_name, is_sent, updated_at)
-          VALUES ($1, $2, $3, $4, NOW())
-          ON CONFLICT (phone) DO UPDATE
-          SET name = EXCLUDED.name, group_name = EXCLUDED.group_name, updated_at = NOW();
-        `;
-        await pgPool.query(query, [lead.name, lead.phone, lead.group, lead.isSent]);
-        successCount++;
+        await pgPool.query(query, values);
+        successCount += chunk.length;
       } catch (e) {
-        console.warn(`Failed to upsert contact ${lead.phone}:`, e.message);
+        console.warn('Batch upsert notice:', e.message);
       }
     }
     return { synced: true, count: successCount, provider: 'vercel_postgres' };
