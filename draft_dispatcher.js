@@ -34,44 +34,40 @@ function renderTemplate(templateString, variables) {
 }
 
 /**
- * Loads contacts from Google Sheet or fallback sample CSV
+ * Loads contacts from a specific Google Sheet tab or fallback sample CSV
  */
-async function loadContacts(sheetUrl, groupFilter = null) {
+async function loadContacts(sheetUrl, targetGid = null) {
   let leads = [];
 
   if (sheetUrl) {
     try {
-      console.log(`📡 Fetching contacts from Google Sheet...`);
-      const res = await fetchGoogleSheetData(sheetUrl);
+      console.log(`📡 Fetching contacts from Google Sheet tab (gid: ${targetGid || 'default'})...`);
+      const res = await fetchGoogleSheetData(sheetUrl, targetGid);
       leads = res.leads;
+      console.log(`Loaded ${leads.length} contacts from tab: "${res.currentTabName}"`);
+      return { leads, tabName: res.currentTabName };
     } catch (err) {
-      console.warn(`Could not load Google Sheet (${err.message}). Using sample_leads.csv.`);
+      console.warn(`Could not load Google Sheet (${err.message}). Using sample CSV.`);
     }
   }
 
-  if (leads.length === 0) {
-    const sampleCsvPath = path.join(__dirname, 'sample_leads.csv');
-    const sampleContent = fs.readFileSync(sampleCsvPath, 'utf8');
-    const { parse } = require('csv-parse/sync');
-    const { normalizeLeadRow } = require('./googleSheets');
-    const records = parse(sampleContent, { columns: true, skip_empty_lines: true, trim: true });
-    leads = records.map((row, idx) => normalizeLeadRow(row, idx));
-  }
+  const sampleCsvPath = path.join(__dirname, 'sample_leads.csv');
+  const sampleContent = fs.readFileSync(sampleCsvPath, 'utf8');
+  const { parse } = require('csv-parse/sync');
+  const { normalizeLeadRow } = require('./googleSheets');
+  const records = parse(sampleContent, { columns: true, skip_empty_lines: true, trim: true });
+  leads = records.map((row, idx) => normalizeLeadRow(row, idx, 'Sample Sheet'));
 
-  if (groupFilter && groupFilter !== 'All') {
-    leads = leads.filter(l => (l.group || 'General').toLowerCase() === groupFilter.toLowerCase());
-  }
-
-  return leads;
+  return { leads, tabName: 'Sample Sheet' };
 }
 
 /**
- * Main dispatcher function
+ * Main dispatcher function: Auto-drafts messages for an entire Sheet Tab in one click
  *
  * @param {Object} options
  * @param {Array} [options.contacts] - Contacts list (or loaded automatically)
  * @param {string} [options.templateText] - Template text with {{variables}}
- * @param {string} [options.group] - Group filter
+ * @param {string} [options.gid] - Specific sheet tab gid to draft
  * @param {number} [options.limit] - Max contacts to process
  * @param {Function} [options.onProgress] - Progress callback
  * @param {boolean} [options.useExistingCdp] - Connect via CDP port 9222 instead of launching profile
@@ -79,14 +75,16 @@ async function loadContacts(sheetUrl, groupFilter = null) {
 async function runDraftDispatcher(options = {}) {
   const {
     templateText = 'Hi {{name}}! Friendly update regarding order #{{orderId}}.',
-    group = 'All',
-    limit = 50,
+    gid = null,
+    limit = 200,
     useExistingCdp = false,
     cdpUrl = 'http://localhost:9222',
     onProgress = () => {}
   } = options;
 
   let contacts = options.contacts;
+  let activeTabName = options.tabName || 'Sheet Tab';
+
   if (!contacts || contacts.length === 0) {
     const configPath = path.join(__dirname, 'config.json');
     let sheetUrl = '';
@@ -96,15 +94,17 @@ async function runDraftDispatcher(options = {}) {
         sheetUrl = cfg.sheetUrl || '';
       } catch (e) {}
     }
-    contacts = await loadContacts(sheetUrl, group);
+    const loaded = await loadContacts(sheetUrl, gid);
+    contacts = loaded.leads;
+    activeTabName = loaded.tabName;
   }
 
   const targetContacts = contacts.slice(0, limit);
   console.log(`\n======================================================`);
-  console.log(`🚀 Starting WhatsApp Semi-Automation Draft Dispatcher`);
-  console.log(`👥 Target Contacts: ${targetContacts.length}`);
-  console.log(`📁 Group: ${group}`);
-  console.log(`🔒 CRITICAL SAFETY: NO SEND / NO ENTER — DRAFTS ONLY`);
+  console.log(`🚀 Starting WhatsApp Auto-Draft Dispatcher (1-Click)`);
+  console.log(`📑 Sheet Tab: ${activeTabName}`);
+  console.log(`👥 Contacts to Draft: ${targetContacts.length}`);
+  console.log(`🔒 SAFETY ENFORCED: NO SEND / NO ENTER — DRAFTS ONLY`);
   console.log(`======================================================\n`);
 
   let context;
@@ -142,13 +142,12 @@ async function runDraftDispatcher(options = {}) {
   const pages = context.pages();
   const page = pages.length > 0 ? pages[0] : await context.newPage();
 
-  // Step 1: Ensure WhatsApp Web is loaded & logged in
+  // Step 1: Ensure WhatsApp Web is ready
   console.log(`Navigating to WhatsApp Web...`);
   await page.goto('https://web.whatsapp.com', { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-  console.log(`Waiting for WhatsApp Web session to be ready (Scan QR code if first time)...`);
+  console.log(`Checking WhatsApp Web login state (Scan QR code if first time)...`);
   try {
-    // Wait for the side chat list or search bar to confirm login
     await page.waitForSelector('div[contenteditable="true"][data-tab="3"], #pane-side, div[role="textbox"]', {
       timeout: 90000
     });
@@ -187,10 +186,10 @@ async function runDraftDispatcher(options = {}) {
     try {
       await page.goto(waUrl, { waitUntil: 'domcontentloaded', timeout: 35000 });
 
-      // Selector for chat message box (supports current WhatsApp Web Lexical & ContentEditable editor)
+      // Selector for chat message box
       const inputSelector = 'footer div[contenteditable="true"], div[data-lexical-editor="true"], div[role="textbox"][contenteditable="true"]';
 
-      // Check for either the input box OR an error dialog (e.g. "Phone number shared via url is invalid")
+      // Check for either the input box OR an error dialog
       const chatLoaded = await Promise.race([
         page.waitForSelector(inputSelector, { timeout: 25000 }).then(() => 'ready'),
         page.waitForSelector('button:has-text("OK"), div[data-animate-modal-body="true"]', { timeout: 25000 }).then(() => 'invalid_modal')
@@ -198,7 +197,6 @@ async function runDraftDispatcher(options = {}) {
 
       if (chatLoaded === 'invalid_modal') {
         console.log(`   ❌ Number not registered on WhatsApp or invalid.`);
-        // Dismiss the modal
         const okBtn = await page.$('button:has-text("OK")');
         if (okBtn) await okBtn.click();
         results.push({ contact: contact.name, phone: cleanPhone, status: 'not_on_whatsapp' });
@@ -211,25 +209,21 @@ async function runDraftDispatcher(options = {}) {
         continue;
       }
 
-      // Chat input box is loaded!
+      // Input box loaded
       const inputBox = await page.$(inputSelector);
       if (inputBox) {
-        // Focus the box
         await inputBox.focus();
 
-        // Check if text is present
         const currentText = await inputBox.innerText();
         if (!currentText || !currentText.trim()) {
-          // If query param didn't auto-fill, insert the message
           console.log(`   Typing text into input box...`);
           await inputBox.fill(message);
         }
 
-        console.log(`   📝 Draft set in chat box!`);
-        console.log(`   🛑 SAFE: NO ENTER / NO SEND CLICKED.`);
+        console.log(`   📝 Draft created in chat!`);
+        console.log(`   🛑 SAFE: NO ENTER / NO SEND.`);
 
-        // Wait 2–4 seconds to let WhatsApp register the draft in local storage and multi-device sync
-        console.log(`   ⏳ Waiting 3 seconds for WhatsApp to register draft...`);
+        // Wait 3 seconds for WhatsApp Web local registration & mobile sync
         await page.waitForTimeout(DEFAULT_DELAY_MS);
 
         results.push({ contact: contact.name, phone: cleanPhone, status: 'drafted', message });
@@ -244,7 +238,7 @@ async function runDraftDispatcher(options = {}) {
       results.push({ contact: contact.name, phone: cleanPhone, status: 'error', error: err.message });
     }
 
-    // Safe inter-contact pause (1.5 - 2.5s) to prevent aggressive browser navigation
+    // Safe pause between contacts
     if (i < targetContacts.length - 1) {
       const pause = 2000 + Math.random() * 1000;
       await page.waitForTimeout(pause);
@@ -252,33 +246,34 @@ async function runDraftDispatcher(options = {}) {
   }
 
   console.log(`\n======================================================`);
-  console.log(`✅ Draft Dispatch Complete!`);
+  console.log(`✅ Draft Dispatch Complete for tab: "${activeTabName}"`);
   console.log(`📊 Total: ${targetContacts.length} | Drafted: ${results.filter(r => r.status === 'drafted').length}`);
-  console.log(`📱 You can now open WhatsApp on your phone or PC and tap Send!`);
+  console.log(`📱 All chats are now drafted in WhatsApp. Tap Send manually!`);
   console.log(`======================================================\n`);
 
   return {
+    tabName: activeTabName,
     total: targetContacts.length,
     drafted: results.filter(r => r.status === 'drafted').length,
     results
   };
 }
 
-// Allow running directly from command line: `node draft_dispatcher.js`
+// Allow CLI execution: `node draft_dispatcher.js --gid=0`
 if (require.main === module) {
   const args = process.argv.slice(2);
-  const groupArg = args.find(a => a.startsWith('--group='))?.split('=')[1] || 'All';
-  const limitArg = parseInt(args.find(a => a.startsWith('--limit='))?.split('=')[1] || '50', 10);
+  const gidArg = args.find(a => a.startsWith('--gid='))?.split('=')[1] || null;
+  const limitArg = parseInt(args.find(a => a.startsWith('--limit='))?.split('=')[1] || '200', 10);
   const cdpArg = args.includes('--cdp');
 
   runDraftDispatcher({
-    group: groupArg,
+    gid: gidArg,
     limit: limitArg,
     useExistingCdp: cdpArg
   }).then(() => {
-    console.log('Script execution finished. Browser session remains open for manual sending.');
+    console.log('Script execution finished.');
   }).catch(err => {
-    console.error('Fatal error in draft dispatcher:', err);
+    console.error('Fatal error:', err);
     process.exit(1);
   });
 }
@@ -286,5 +281,6 @@ if (require.main === module) {
 module.exports = {
   runDraftDispatcher,
   cleanPhoneNumber,
-  renderTemplate
+  renderTemplate,
+  loadContacts
 };

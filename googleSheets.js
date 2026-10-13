@@ -9,7 +9,12 @@ function parseGoogleSheetUrl(inputUrl) {
 
   // If it's already a direct published CSV link
   if (trimmed.includes('pub?output=csv') || trimmed.includes('/export?format=csv')) {
-    return { exportUrl: trimmed, sheetId: null, gid: null };
+    const gidMatch = trimmed.match(/[?&#]gid=([0-9-]+)/);
+    return {
+      exportUrl: trimmed,
+      sheetId: null,
+      gid: gidMatch ? gidMatch[1] : '0'
+    };
   }
 
   // Check for standard Google Sheet URL: https://docs.google.com/spreadsheets/d/<ID>/...
@@ -20,13 +25,59 @@ function parseGoogleSheetUrl(inputUrl) {
 
   // Extract gid (tab id) if present
   let gid = '0';
-  const gidMatch = trimmed.match(/[?&#]gid=([0-9]+)/);
+  const gidMatch = trimmed.match(/[?&#]gid=([0-9-]+)/);
   if (gidMatch && gidMatch[1]) {
     gid = gidMatch[1];
   }
 
   const exportUrl = `https://docs.google.com/spreadsheets/d/${sheetId}/export?format=csv&gid=${gid}`;
   return { exportUrl, sheetId, gid };
+}
+
+/**
+ * Discovers all worksheets/tabs (names and gids) from Google Sheet htmlview
+ */
+async function fetchGoogleSheetTabs(sheetId) {
+  if (!sheetId) return [{ name: 'Main Sheet', gid: '0' }];
+
+  const htmlviewUrl = `https://docs.google.com/spreadsheets/d/${sheetId}/htmlview`;
+  try {
+    const response = await fetch(htmlviewUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) WhatsAppAutomation/1.0',
+        'Accept': 'text/html,*/*'
+      },
+      redirect: 'follow'
+    });
+
+    if (!response.ok) {
+      return [{ name: 'Main Sheet', gid: '0' }];
+    }
+
+    const html = await response.text();
+    const tabs = [];
+
+    // Pattern 1: items.push({name: "Tab Name", ... gid: "12345"})
+    const itemRegex = /\{name:\s*"([^"]+)",[^}]*gid:\s*"([0-9-]+)"/g;
+    let match;
+    while ((match = itemRegex.exec(html)) !== null) {
+      tabs.push({ name: match[1], gid: match[2] });
+    }
+
+    // Pattern 2: <li id="sheet-button-12345"><a href="#gid=12345">Tab Name</a>
+    const liRegex = /<li id="sheet-button-([0-9-]+)"[^>]*><a[^>]*>([^<]+)<\/a>/g;
+    while ((match = liRegex.exec(html)) !== null) {
+      if (!tabs.some(t => t.gid === match[1])) {
+        tabs.push({ name: match[2].trim(), gid: match[1] });
+      }
+    }
+
+    if (tabs.length > 0) return tabs;
+  } catch (err) {
+    console.warn(`Could not discover tabs via htmlview (${err.message}). Defaulting to gid=0.`);
+  }
+
+  return [{ name: 'Main Sheet', gid: '0' }];
 }
 
 /**
@@ -39,7 +90,7 @@ function normalizeKey(header) {
 /**
  * Maps raw CSV row objects into structured lead records
  */
-function normalizeLeadRow(row, index) {
+function normalizeLeadRow(row, index, tabName = 'Main Sheet') {
   const normalizedRow = {};
   for (const [key, val] of Object.entries(row)) {
     const cleanKey = normalizeKey(key);
@@ -59,7 +110,7 @@ function normalizeLeadRow(row, index) {
 
   const name =
     findValue(['name', 'fullname', 'customername', 'leadname', 'clientname', 'customer', 'client', 'person']) ||
-    `Lead #${index + 1}`;
+    `Contact #${index + 1}`;
 
   const phone =
     findValue(['phone', 'phonenumber', 'mobile', 'mobilenumber', 'whatsapp', 'contactnumber', 'contact', 'cell', 'tel']);
@@ -79,9 +130,8 @@ function normalizeLeadRow(row, index) {
   const customMessage =
     findValue(['message', 'custommessage', 'customtext', 'text', 'notes', 'msg']);
 
-  const group =
-    findValue(['group', 'groups', 'tag', 'tags', 'category', 'categories', 'segment', 'batch', 'list', 'team']) ||
-    'General';
+  // Tab Name acts as the Group / Audience Segment!
+  const group = tabName;
 
   // Build variables dictionary for any column in the sheet
   const variables = {};
@@ -96,6 +146,7 @@ function normalizeLeadRow(row, index) {
   variables['name'] = name;
   variables['phone'] = phone;
   variables['group'] = group;
+  variables['tab'] = tabName;
   variables['orderId'] = orderId;
   variables['status'] = status;
   variables['time'] = time;
@@ -105,6 +156,7 @@ function normalizeLeadRow(row, index) {
     name,
     phone,
     group,
+    tab: tabName,
     orderId,
     status,
     time,
@@ -116,15 +168,34 @@ function normalizeLeadRow(row, index) {
 }
 
 /**
- * Fetches and parses a Google Sheet by URL or ID
+ * Fetches and parses a specific tab from Google Sheet
+ *
+ * @param {string} sheetUrlOrId - Google Sheet link or ID
+ * @param {string} [targetGid] - Specific tab/worksheet gid to load
  */
-async function fetchGoogleSheetData(sheetUrlOrId) {
+async function fetchGoogleSheetData(sheetUrlOrId, targetGid = null) {
   const parsed = parseGoogleSheetUrl(sheetUrlOrId);
   if (!parsed) {
     throw new Error('Invalid Google Sheet URL or ID. Please paste a valid docs.google.com/spreadsheets link.');
   }
 
-  const response = await fetch(parsed.exportUrl, {
+  const activeGid = targetGid != null ? String(targetGid) : (parsed.gid || '0');
+  const exportUrl = parsed.sheetId
+    ? `https://docs.google.com/spreadsheets/d/${parsed.sheetId}/export?format=csv&gid=${activeGid}`
+    : parsed.exportUrl;
+
+  // Discover all available tabs in this spreadsheet
+  let tabs = [];
+  if (parsed.sheetId) {
+    tabs = await fetchGoogleSheetTabs(parsed.sheetId);
+  } else {
+    tabs = [{ name: 'Current Tab', gid: activeGid }];
+  }
+
+  // Find active tab display name
+  const currentTab = tabs.find(t => String(t.gid) === activeGid) || tabs[0] || { name: 'Main Sheet', gid: activeGid };
+
+  const response = await fetch(exportUrl, {
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) WhatsAppAutomation/1.0',
       'Accept': 'text/csv,text/plain,*/*'
@@ -134,7 +205,7 @@ async function fetchGoogleSheetData(sheetUrlOrId) {
 
   if (!response.ok) {
     if (response.status === 404) {
-      throw new Error(`Google Sheet not found (404). Please check the URL.`);
+      throw new Error(`Google Sheet or tab not found (404). Please check the URL.`);
     }
     if (response.status === 403 || response.status === 401) {
       throw new Error(
@@ -147,7 +218,6 @@ async function fetchGoogleSheetData(sheetUrlOrId) {
   const contentType = response.headers.get('content-type') || '';
   const text = await response.text();
 
-  // If Google returned an HTML login page instead of CSV
   if (text.trim().startsWith('<!DOCTYPE html>') || text.includes('accounts.google.com') || contentType.includes('text/html')) {
     throw new Error(
       `Permission denied: Google Sheet is not publicly viewable. Please open the Google Sheet, click "Share", and change General Access to "Anyone with the link can view".`
@@ -155,7 +225,7 @@ async function fetchGoogleSheetData(sheetUrlOrId) {
   }
 
   if (!text.trim()) {
-    throw new Error('The Google Sheet is empty. Please add header columns and data rows.');
+    throw new Error(`The tab "${currentTab.name}" is empty. Please add header columns and data rows.`);
   }
 
   // Parse CSV
@@ -168,29 +238,31 @@ async function fetchGoogleSheetData(sheetUrlOrId) {
       relax_column_count: true
     });
   } catch (parseErr) {
-    throw new Error(`Failed to parse CSV data from Google Sheet: ${parseErr.message}`);
+    throw new Error(`Failed to parse CSV from tab "${currentTab.name}": ${parseErr.message}`);
   }
 
   if (!records || records.length === 0) {
-    throw new Error('No data rows found in the Google Sheet. Make sure row 1 has headers and row 2+ has data.');
+    throw new Error(`No contact rows found in tab "${currentTab.name}". Row 1 should have headers (Name, Phone...) and Row 2+ contacts.`);
   }
 
-  const leads = records.map((row, idx) => normalizeLeadRow(row, idx));
-
-  // Determine headers detected
+  const leads = records.map((row, idx) => normalizeLeadRow(row, idx, currentTab.name));
   const headers = Object.keys(records[0] || {});
 
   return {
     leads,
     headers,
     totalCount: leads.length,
-    exportUrl: parsed.exportUrl,
-    sheetId: parsed.sheetId
+    exportUrl,
+    sheetId: parsed.sheetId,
+    activeGid,
+    currentTabName: currentTab.name,
+    tabs
   };
 }
 
 module.exports = {
   parseGoogleSheetUrl,
+  fetchGoogleSheetTabs,
   fetchGoogleSheetData,
   normalizeLeadRow
 };

@@ -4,7 +4,7 @@ const path = require('path');
 const multer = require('multer');
 require('dotenv').config();
 
-const { fetchGoogleSheetData } = require('./googleSheets');
+const { fetchGoogleSheetData, fetchGoogleSheetTabs } = require('./googleSheets');
 const {
   isSupabaseConfigured,
   getSupabaseConfig
@@ -86,6 +86,7 @@ function normalizeTemplates(rawTemplates) {
 function loadConfig() {
   const defaults = {
     sheetUrl: process.env.GOOGLE_SHEET_URL || '',
+    currentGid: '0',
     defaultCountryCode: process.env.DEFAULT_COUNTRY_CODE || '91',
     defaultTemplate: 'welcome',
     supabaseUrl: process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || '',
@@ -143,6 +144,9 @@ let currentLeads = [];
 let sheetStatus = {
   isConnected: false,
   sheetUrl: appConfig.sheetUrl || '',
+  currentGid: appConfig.currentGid || '0',
+  currentTabName: 'Main Sheet',
+  tabs: [{ name: 'Main Sheet', gid: '0' }],
   lastSynced: null,
   error: null,
   headers: []
@@ -151,7 +155,6 @@ const sentLeadIds = new Set();
 
 /**
  * Normalizes phone numbers into E.164 without '+' or leading zeros.
- * Automatically adds country code if 10 digits are provided.
  */
 function cleanPhoneNumber(phone, defaultCountryCode = appConfig.defaultCountryCode || '91') {
   if (!phone) return '';
@@ -186,37 +189,24 @@ function createWaLink(phone, text) {
   return `https://wa.me/${normalizedPhone}?text=${encodedText}`;
 }
 
-// Compute group summary
-function getGroupsSummary(leads) {
-  const groupCounts = {};
-  leads.forEach(l => {
-    const g = l.group || 'General';
-    groupCounts[g] = (groupCounts[g] || 0) + 1;
-  });
-  const list = [{ name: 'All', count: leads.length }];
-  for (const [name, count] of Object.entries(groupCounts)) {
-    list.push({ name, count });
-  }
-  return list;
-}
-
 // Load initial data
 async function initializeData() {
   if (appConfig.sheetUrl) {
     console.log(`Connecting to configured Google Sheet: ${appConfig.sheetUrl}`);
     try {
-      const res = await fetchGoogleSheetData(appConfig.sheetUrl);
+      const res = await fetchGoogleSheetData(appConfig.sheetUrl, appConfig.currentGid || null);
       currentLeads = res.leads;
       sheetStatus = {
         isConnected: true,
         sheetUrl: appConfig.sheetUrl,
+        currentGid: res.activeGid,
+        currentTabName: res.currentTabName,
+        tabs: res.tabs,
         lastSynced: new Date().toISOString(),
         error: null,
         headers: res.headers
       };
-      console.log(`Successfully synced ${res.totalCount} leads from Google Sheet!`);
-
-      // Permanently store ONLY Name and Phone in DB (Vercel Postgres or Supabase)
+      console.log(`Loaded ${res.totalCount} leads from tab "${res.currentTabName}" (tabs found: ${res.tabs.length})`);
       await syncContactsToDatabase(currentLeads);
       return;
     } catch (err) {
@@ -232,22 +222,27 @@ async function initializeData() {
     const { parse } = require('csv-parse/sync');
     const { normalizeLeadRow } = require('./googleSheets');
     const records = parse(sampleContent, { columns: true, skip_empty_lines: true, trim: true });
-    currentLeads = records.map((row, idx) => normalizeLeadRow(row, idx));
+    currentLeads = records.map((row, idx) => normalizeLeadRow(row, idx, 'VIP Contacts'));
     sheetStatus.headers = Object.keys(records[0] || {});
-
-    // Sync sample contact names & phones to active DB if available
+    sheetStatus.tabs = [
+      { name: 'VIP Contacts', gid: '0' },
+      { name: 'New Leads', gid: '1' },
+      { name: 'Wholesale Orders', gid: '2' }
+    ];
+    sheetStatus.currentGid = '0';
+    sheetStatus.currentTabName = 'VIP Contacts';
     await syncContactsToDatabase(currentLeads);
   } catch (err) {
     currentLeads = [
-      { id: 1, name: 'Rohit Sharma', phone: '+91 98765 43210', group: 'VIP', orderId: 'ORD-101', status: 'Out for delivery', time: '3:00 PM', variables: { name: 'Rohit Sharma', phone: '+91 98765 43210', group: 'VIP', orderId: 'ORD-101', status: 'Out for delivery', time: '3:00 PM' } },
-      { id: 2, name: 'Priya Singh', phone: '+91 91234 56789', group: 'New Leads', orderId: 'ORD-102', status: 'Processing', time: '5:30 PM', variables: { name: 'Priya Singh', phone: '+91 91234 56789', group: 'New Leads', orderId: 'ORD-102', status: 'Processing', time: '5:30 PM' } }
+      { id: 1, name: 'Rohit Sharma', phone: '+91 98765 43210', tab: 'VIP Contacts', orderId: 'ORD-101', status: 'Out for delivery', time: '3:00 PM', variables: { name: 'Rohit Sharma', phone: '+91 98765 43210', orderId: 'ORD-101', status: 'Out for delivery', time: '3:00 PM' } },
+      { id: 2, name: 'Priya Singh', phone: '+91 91234 56789', tab: 'VIP Contacts', orderId: 'ORD-102', status: 'Processing', time: '5:30 PM', variables: { name: 'Priya Singh', phone: '+91 91234 56789', orderId: 'ORD-102', status: 'Processing', time: '5:30 PM' } }
     ];
   }
 }
 
 // --- API Endpoints ---
 
-// Connect & sync a new Google Sheet
+// Connect & sync Google Sheet
 app.post('/api/sheet/connect', async (req, res) => {
   const { sheetUrl, countryCode } = req.body;
   if (!sheetUrl) {
@@ -260,81 +255,130 @@ app.post('/api/sheet/connect', async (req, res) => {
     sentLeadIds.clear();
 
     appConfig.sheetUrl = sheetUrl.trim();
+    appConfig.currentGid = data.activeGid;
     if (countryCode) appConfig.defaultCountryCode = countryCode.trim();
     saveConfig(appConfig);
 
     sheetStatus = {
       isConnected: true,
       sheetUrl: appConfig.sheetUrl,
+      currentGid: data.activeGid,
+      currentTabName: data.currentTabName,
+      tabs: data.tabs,
       lastSynced: new Date().toISOString(),
       error: null,
       headers: data.headers
     };
 
-    // Permanently sync Name and Phone to Database (Vercel Postgres or Supabase)
     await syncContactsToDatabase(currentLeads);
 
     res.json({
       success: true,
-      message: `Successfully connected Google Sheet! Loaded ${data.totalCount} contacts across ${getGroupsSummary(currentLeads).length - 1} groups.`,
+      message: `Connected Google Sheet! Loaded ${data.totalCount} contacts from tab "${data.currentTabName}".`,
       sheetStatus,
       leads: currentLeads,
-      groups: getGroupsSummary(currentLeads),
       headers: data.headers
     });
   } catch (err) {
     sheetStatus.error = err.message;
-    res.status(400).json({
-      success: false,
-      error: err.message
-    });
+    res.status(400).json({ success: false, error: err.message });
   }
 });
 
-// Refresh / Sync from current Google Sheet
+// Switch active Sheet Tab
+app.post('/api/sheet/switch-tab', async (req, res) => {
+  const { gid } = req.body;
+  const targetGid = gid != null ? String(gid) : '0';
+
+  if (!appConfig.sheetUrl) {
+    // Local sample mode simulation
+    const tabObj = sheetStatus.tabs.find(t => String(t.gid) === targetGid) || { name: 'Sheet Tab', gid: targetGid };
+    sheetStatus.currentGid = targetGid;
+    sheetStatus.currentTabName = tabObj.name;
+    currentLeads.forEach(l => l.tab = tabObj.name);
+    return res.json({
+      success: true,
+      tabName: tabObj.name,
+      leads: currentLeads,
+      sheetStatus
+    });
+  }
+
+  try {
+    const data = await fetchGoogleSheetData(appConfig.sheetUrl, targetGid);
+    currentLeads = data.leads;
+    sentLeadIds.clear();
+
+    appConfig.currentGid = targetGid;
+    saveConfig(appConfig);
+
+    sheetStatus = {
+      isConnected: true,
+      sheetUrl: appConfig.sheetUrl,
+      currentGid: data.activeGid,
+      currentTabName: data.currentTabName,
+      tabs: data.tabs,
+      lastSynced: new Date().toISOString(),
+      error: null,
+      headers: data.headers
+    };
+
+    await syncContactsToDatabase(currentLeads);
+
+    res.json({
+      success: true,
+      message: `Switched to tab "${data.currentTabName}"! Loaded ${data.totalCount} contacts.`,
+      tabName: data.currentTabName,
+      count: data.totalCount,
+      leads: currentLeads,
+      sheetStatus
+    });
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+// Refresh / Sync active sheet tab
 app.post('/api/sheet/sync', async (req, res) => {
   if (!appConfig.sheetUrl) {
     return res.status(400).json({ error: 'No Google Sheet URL is currently connected. Please connect one first.' });
   }
 
   try {
-    const data = await fetchGoogleSheetData(appConfig.sheetUrl);
+    const data = await fetchGoogleSheetData(appConfig.sheetUrl, sheetStatus.currentGid);
     currentLeads = data.leads;
     sheetStatus = {
       isConnected: true,
       sheetUrl: appConfig.sheetUrl,
+      currentGid: data.activeGid,
+      currentTabName: data.currentTabName,
+      tabs: data.tabs,
       lastSynced: new Date().toISOString(),
       error: null,
       headers: data.headers
     };
 
-    // Permanently sync Name and Phone to Database
     await syncContactsToDatabase(currentLeads);
 
     res.json({
       success: true,
-      message: `Synced ${data.totalCount} contacts successfully!`,
+      message: `Synced tab "${data.currentTabName}" (${data.totalCount} contacts)!`,
       sheetStatus,
       leads: currentLeads,
-      groups: getGroupsSummary(currentLeads),
       headers: data.headers
     });
   } catch (err) {
     sheetStatus.error = err.message;
-    res.status(400).json({
-      success: false,
-      error: err.message
-    });
+    res.status(400).json({ success: false, error: err.message });
   }
 });
 
-// Get state (leads, templates, groups, status, Database status)
+// Get state (leads, templates, sheet tabs, DB status)
 app.get('/api/state', (req, res) => {
   res.json({
     sheetStatus,
     leads: currentLeads.map(l => ({ ...l, isSent: sentLeadIds.has(l.id) })),
-    groups: getGroupsSummary(currentLeads),
-    templates: appConfig.templates, // ephemeral / session only
+    templates: appConfig.templates,
     defaultTemplate: appConfig.defaultTemplate || Object.keys(appConfig.templates)[0] || 'welcome',
     defaultCountryCode: appConfig.defaultCountryCode,
     supabaseConfig: getSupabaseConfig(),
@@ -386,30 +430,6 @@ app.post('/api/postgres/config', async (req, res) => {
   });
 });
 
-// Get contacts in a specific group
-app.get('/api/group-contacts/:groupName', (req, res) => {
-  const { groupName } = req.params;
-  const decodedGroup = decodeURIComponent(groupName);
-
-  const matched = decodedGroup === 'All'
-    ? currentLeads
-    : currentLeads.filter(l => (l.group || 'General').toLowerCase() === decodedGroup.toLowerCase());
-
-  res.json({
-    group: decodedGroup,
-    count: matched.length,
-    contacts: matched.map(l => ({
-      id: l.id,
-      name: l.name,
-      phone: l.phone,
-      cleanPhone: cleanPhoneNumber(l.phone),
-      group: l.group || 'General',
-      status: l.status,
-      isSent: sentLeadIds.has(l.id)
-    }))
-  });
-});
-
 // Media upload endpoint
 app.post('/api/upload-media', upload.single('mediaFile'), (req, res) => {
   if (!req.file) {
@@ -429,7 +449,7 @@ app.post('/api/upload-media', upload.single('mediaFile'), (req, res) => {
   });
 });
 
-// Save single template (Temporary/Session only - NOT stored in Database)
+// Save single template (Temporary/Session only)
 app.post('/api/templates/save-single', (req, res) => {
   const { key, title, text, mediaUrl, mediaType } = req.body;
   if (!key || !text) {
@@ -448,7 +468,7 @@ app.post('/api/templates/save-single', (req, res) => {
   res.json({ success: true, key: cleanKey, template: appConfig.templates[cleanKey], templates: appConfig.templates });
 });
 
-// Delete template (Temporary/Session only)
+// Delete template
 app.delete('/api/templates/:key', (req, res) => {
   const { key } = req.params;
   if (appConfig.templates[key]) {
@@ -458,17 +478,7 @@ app.delete('/api/templates/:key', (req, res) => {
   res.json({ success: true, templates: appConfig.templates });
 });
 
-// Save default template
-app.post('/api/set-default-template', (req, res) => {
-  const { defaultTemplate } = req.body;
-  if (defaultTemplate && appConfig.templates[defaultTemplate]) {
-    appConfig.defaultTemplate = defaultTemplate;
-    saveConfig(appConfig);
-  }
-  res.json({ success: true, defaultTemplate: appConfig.defaultTemplate });
-});
-
-// Mark lead as sent (updates permanent Database if configured)
+// Mark lead as sent
 app.post('/api/leads/mark-sent', async (req, res) => {
   const { id } = req.body;
   if (id != null) {
@@ -489,42 +499,43 @@ app.post('/api/leads/reset-sent', async (req, res) => {
   res.json({ success: true });
 });
 
-// --- Playwright Semi-Automation Draft Dispatcher API ---
+// --- Playwright 1-Click Auto-Draft Dispatcher API ---
 app.post('/api/playwright/start-drafts', async (req, res) => {
   if (playwrightState.isRunning) {
     return res.status(400).json({ error: 'A Playwright drafting session is already running.' });
   }
 
-  const { group = 'All', templateKey, limit = 50, useExistingCdp = false, cdpUrl = 'http://localhost:9222' } = req.body;
+  const { templateKey, limit = 200, useExistingCdp = false, cdpUrl = 'http://localhost:9222' } = req.body;
   const tpl = appConfig.templates[templateKey] || Object.values(appConfig.templates)[0];
   const templateText = tpl ? tpl.text : 'Hi {{name}}!';
 
-  const groupLeads = group === 'All'
-    ? currentLeads
-    : currentLeads.filter(l => (l.group || 'General').toLowerCase() === group.toLowerCase());
-
-  const targetCount = Math.min(groupLeads.length, limit);
-  if (targetCount === 0) {
-    return res.status(400).json({ error: 'No contacts found for selected group.' });
+  const targetContacts = currentLeads.slice(0, limit);
+  if (targetContacts.length === 0) {
+    return res.status(400).json({ error: 'No contacts found in current sheet tab.' });
   }
 
   playwrightState = {
     isRunning: true,
     currentIndex: 0,
-    total: targetCount,
+    total: targetContacts.length,
     currentContact: '',
     currentPhone: '',
+    tabName: sheetStatus.currentTabName,
     status: 'starting',
     history: []
   };
 
-  res.json({ success: true, message: 'Draft automation started in Chrome!', state: playwrightState });
+  res.json({
+    success: true,
+    message: `Auto-draft started for tab "${sheetStatus.currentTabName}" (${targetContacts.length} contacts)!`,
+    state: playwrightState
+  });
 
   // Run in background
   runDraftDispatcher({
-    contacts: groupLeads,
+    contacts: targetContacts,
+    tabName: sheetStatus.currentTabName,
     templateText,
-    group,
     limit,
     useExistingCdp,
     cdpUrl,
@@ -571,7 +582,7 @@ app.get('/', (req, res) => {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>WhatsApp Automation Dispatcher • Google Sheets & Cloud DB</title>
+  <title>WhatsApp Automation Dispatcher • Sheet Tabs & Auto-Draft</title>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <style>
     :root {
@@ -649,6 +660,8 @@ app.get('/', (req, res) => {
     }
     .btn-primary { background: var(--primary); color: white; }
     .btn-primary:hover { background: var(--primary-hover); }
+    .btn-accent { background: #008069; color: white; }
+    .btn-accent:hover { background: #006654; }
     .btn-secondary { background: #E9EDEF; color: #111B21; }
     .btn-secondary:hover { background: #D1D7DB; }
     .btn-sm { padding: 6px 12px; font-size: 13px; border-radius: 6px; }
@@ -679,14 +692,50 @@ app.get('/', (req, res) => {
     }
     .guide-box code { background: #E2E8F0; padding: 2px 5px; border-radius: 4px; font-size: 12px; }
 
-    /* Control Box: 3-Step Campaign Bar */
+    /* SHEET TABS BAR */
+    .sheet-tabs-wrapper {
+      margin-top: 10px;
+      padding-top: 10px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .sheet-tabs-list {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .sheet-tab-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 7px 14px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      background: #F0F2F5;
+      color: #334155;
+      cursor: pointer;
+      border: 1.5px solid transparent;
+      transition: all 0.2s;
+    }
+    .sheet-tab-pill:hover { background: #E2E8F0; }
+    .sheet-tab-pill.active {
+      background: #E7FCE3;
+      color: #0E702A;
+      border-color: #25D366;
+    }
+
+    /* 3-Step Campaign Bar */
     .campaign-control-grid {
       display: grid;
-      grid-template-columns: 1fr 1fr auto;
+      grid-template-columns: 1.2fr 1.2fr 1fr;
       gap: 16px;
       align-items: flex-end;
     }
-    @media (max-width: 820px) {
+    @media (max-width: 860px) {
       .campaign-control-grid { grid-template-columns: 1fr; }
     }
     .step-box { display: flex; flex-direction: column; gap: 6px; }
@@ -788,7 +837,7 @@ app.get('/', (req, res) => {
 
     .lead-name { font-weight: 600; color: #111B21; }
     .lead-phone { font-family: monospace; color: #008069; font-weight: 600; font-size: 13px; }
-    .group-pill {
+    .tab-tag {
       display: inline-block;
       font-size: 11px;
       background: #F0FDF4;
@@ -957,17 +1006,17 @@ app.get('/', (req, res) => {
         <div class="logo">💬</div>
         <div>
           <h1>WhatsApp Automation Dispatcher</h1>
-          <p class="subtitle">Google Sheets &bull; Permanent Contacts (Vercel Postgres &amp; Supabase) &bull; Ephemeral Media Templates</p>
+          <p class="subtitle">Multi-Tab Google Sheets &bull; 1-Click Auto-Draft for Entire Tab &bull; Playwright</p>
         </div>
       </div>
       <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-        <button class="btn btn-primary btn-sm" onclick="openPlaywrightModal()" title="Auto-open chats and draft messages without sending">
-          <span>🤖</span> Auto-Draft (Playwright)
+        <button class="btn btn-primary btn-sm" onclick="open1ClickDraftModal()" title="Draft messages for all contacts in current tab with 1 click">
+          ⚡ 1-Click Auto-Draft Tab
         </button>
         <button class="btn btn-secondary btn-sm" id="dbBtn" onclick="openDatabaseModal()">
           <span id="dbIcon">☁️</span> <span id="dbStatusText">Cloud Database</span>
         </button>
-        <button class="btn btn-secondary btn-sm" onclick="openTemplatesModal()">🎨 Template & Media Manager</button>
+        <button class="btn btn-secondary btn-sm" onclick="openTemplatesModal()">🎨 Template & Media</button>
         <a href="/api/download-sample" class="btn btn-secondary btn-sm">📥 Sample CSV</a>
       </div>
     </header>
@@ -976,7 +1025,7 @@ app.get('/', (req, res) => {
     <div class="card">
       <div class="sheet-bar">
         <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
-          <div style="font-weight: 600; font-size: 14px;">📊 Google Sheet Connection</div>
+          <div style="font-weight: 600; font-size: 14px;">📊 Google Spreadsheet Connection</div>
           <div id="statusBadge" class="status-badge status-disconnected">● Checking...</div>
         </div>
 
@@ -985,56 +1034,62 @@ app.get('/', (req, res) => {
             <input type="text" id="sheetUrlInput" placeholder="Paste your Google Sheet link here..." />
           </div>
           <button class="btn btn-primary" id="connectBtn" onclick="connectSheet()">
-            <span>🔗 Connect & Sync</span>
+            <span>🔗 Connect Spreadsheet</span>
           </button>
-          <button class="btn btn-secondary" id="syncBtn" onclick="syncSheet()" title="Reload latest rows from Google Sheets">
-            <span>🔄 Refresh</span>
+          <button class="btn btn-secondary" id="syncBtn" onclick="syncSheet()" title="Reload active tab from Google Sheets">
+            <span>🔄 Refresh Tab</span>
           </button>
         </div>
 
+        <!-- Discovered Sheet Tabs List -->
+        <div class="sheet-tabs-wrapper">
+          <div style="font-size: 12px; font-weight: 700; color: #555; text-transform: uppercase;">
+            📑 Spreadsheet Tabs (Worksheets):
+          </div>
+          <div class="sheet-tabs-list" id="sheetTabsList">
+            <span style="font-size: 12px; color: #888;">Connect a Google Sheet to see all tabs</span>
+          </div>
+        </div>
+
         <div>
-          <span class="guide-toggle" onclick="toggleGuide()">ℹ️ How to format and share your Google Sheet &darr;</span>
+          <span class="guide-toggle" onclick="toggleGuide()">ℹ️ How to format tabs in Google Sheets &darr;</span>
           <div id="guideBox" class="guide-box">
             <ol>
-              <li>Create a spreadsheet on <a href="https://sheets.new" target="_blank" style="color: #008069; font-weight: 600;">Google Sheets</a>.</li>
-              <li>Include headers: <code>Name</code>, <code>Phone</code>, <code>Group</code> (e.g. VIP, New Leads), <code>OrderId</code>, <code>Status</code>, <code>Time</code>.</li>
+              <li>Create separate tabs at the bottom of your Google Sheet (e.g. <code>VIP Contacts</code>, <code>New Leads</code>, <code>Delhi Orders</code>).</li>
+              <li>In each tab, make row 1 headers: <code>Name</code>, <code>Phone</code>, <code>OrderId</code>, <code>Status</code>, <code>Time</code>.</li>
               <li>Click <strong>Share</strong> (top right) &rarr; change General access to <strong>"Anyone with the link can view"</strong>.</li>
-              <li>Paste the URL above and click <strong>Connect & Sync</strong>!</li>
+              <li>Paste the URL above. All tabs will be automatically discovered, and you can switch between them in 1 click!</li>
             </ol>
           </div>
         </div>
       </div>
     </div>
 
-    <!-- 3-STEP CAMPAIGN CONTROLLER CARD -->
+    <!-- CAMPAIGN CONTROLLER: SELECT TAB + TEMPLATE + 1-CLICK DRAFT -->
     <div class="card" style="border-left: 4px solid var(--primary);">
       <div class="campaign-control-grid">
-        <!-- Step 1: Select Contact Group -->
+        <!-- Step 1: Current Sheet Tab -->
         <div class="step-box">
           <div class="step-label">
-            <span>1️⃣ Select Contact Group</span>
-            <button class="btn btn-secondary btn-sm" style="padding: 2px 8px; font-size: 11px;" onclick="openGroupModal()">
-              👥 View Group Numbers
-            </button>
+            <span>1️⃣ Active Sheet Tab</span>
+            <span id="tabCountBadge" style="font-size: 11px; color: #0E702A; font-weight: 600;">0 contacts</span>
           </div>
-          <select id="groupSelect" onchange="onGroupChanged(this.value)">
-            <option value="All">All Contacts (0)</option>
-          </select>
+          <select id="activeTabDropdown" onchange="switchSheetTab(this.value)"></select>
         </div>
 
-        <!-- Step 2: Select Global Template -->
+        <!-- Step 2: Global Template -->
         <div class="step-box">
           <div class="step-label">
-            <span>2️⃣ Select Template (Applied at once)</span>
+            <span>2️⃣ Template for this Tab</span>
             <span id="templateMediaBadge" style="display: none;" class="media-indicator">🖼️ Has Media</span>
           </div>
           <select id="globalTemplateSelect" onchange="onGlobalTemplateChanged(this.value)"></select>
         </div>
 
-        <!-- Quick Reset / Stats Action -->
-        <div style="display: flex; gap: 8px;">
-          <button class="btn btn-primary" onclick="applyTemplateToAll()" title="Apply current template to all visible rows">
-            ⚡ Apply to All
+        <!-- Step 3: 1-Click Auto-Draft Trigger -->
+        <div>
+          <button class="btn btn-primary" style="width: 100%; height: 42px; font-size: 14px;" onclick="open1ClickDraftModal()">
+            ⚡ 1-Click Auto-Draft Tab
           </button>
         </div>
       </div>
@@ -1044,7 +1099,7 @@ app.get('/', (req, res) => {
     <div class="stats-grid">
       <div class="stat-card">
         <div class="stat-val" id="totalLeadsCount">0</div>
-        <div class="stat-lbl">Group Contacts</div>
+        <div class="stat-lbl">Tab Contacts</div>
       </div>
       <div class="stat-card">
         <div class="stat-val" id="sentCount" style="color: #0E702A;">0</div>
@@ -1076,9 +1131,9 @@ app.get('/', (req, res) => {
         <thead>
           <tr>
             <th style="width: 50px;">Status</th>
-            <th>Contact & Group</th>
+            <th>Contact & Tab</th>
             <th>Order Details</th>
-            <th>Template & Message Preview</th>
+            <th>Template & Preview</th>
             <th style="width: 150px; text-align: center;">Action</th>
           </tr>
         </thead>
@@ -1089,42 +1144,74 @@ app.get('/', (req, res) => {
     </div>
   </div>
 
-  <!-- MODAL: Group Contacts Inspector -->
-  <div id="groupModal" class="modal-backdrop">
-    <div class="modal">
+  <!-- MODAL: 1-Click Auto-Draft Dispatcher (Playwright) -->
+  <div id="playwrightModal" class="modal-backdrop">
+    <div class="modal" style="max-width: 640px;">
       <div class="modal-header">
-        <div class="modal-title" id="groupModalTitle">👥 Group Numbers</div>
-        <button class="close-btn" onclick="closeGroupModal()">&times;</button>
+        <div class="modal-title">⚡ 1-Click Auto-Draft for Entire Tab</div>
+        <button class="close-btn" onclick="closePlaywrightModal()">&times;</button>
       </div>
-      <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 12px;">
-        All contact numbers in this group. You can copy them for broadcasting or records.
-      </p>
+      <div class="modal-body">
+        <div style="background: #FEF3C7; border: 1.5px solid #F59E0B; padding: 12px; border-radius: 8px; font-size: 13px; color: #92400E; margin-bottom: 14px; line-height: 1.5;">
+          <strong>🔒 100% Safe Semi-Automation:</strong>
+          This bot opens each chat from the tab and types your personalized message as an <strong>unsent draft</strong>. It <strong>NEVER sends or hits Enter</strong>. The drafts stay ready in your WhatsApp account so you can manually tap Send on your mobile phone or PC!
+        </div>
 
-      <div style="display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap;">
-        <button class="btn btn-secondary btn-sm" onclick="copyGroupNumbers(',')">📋 Copy All (Comma-Separated)</button>
-        <button class="btn btn-secondary btn-sm" onclick="copyGroupNumbers('\\n')">📋 Copy All (One Per Line)</button>
-      </div>
+        <div style="background: #F0FDF4; border: 1px solid #BBF7D0; padding: 12px; border-radius: 8px; margin-bottom: 14px;">
+          <div style="font-size: 13px; font-weight: 600; color: #166534;">
+            📑 Selected Tab: <span id="pwModalTabName">Main Sheet</span>
+          </div>
+          <div style="font-size: 12px; color: #15803D; margin-top: 2px;">
+            👥 Contacts to draft: <strong id="pwModalContactCount">0</strong>
+          </div>
+        </div>
 
-      <div class="modal-body" style="max-height: 50vh;">
-        <table style="width: 100%; font-size: 13px;">
-          <thead>
-            <tr>
-              <th>Name</th>
-              <th>Phone</th>
-              <th>Status</th>
-            </tr>
-          </thead>
-          <tbody id="groupModalBody"></tbody>
-        </table>
-      </div>
+        <div style="margin-bottom: 14px;">
+          <label style="font-size: 11px; font-weight: 700; text-transform: uppercase; color: #555;">Choose Template</label>
+          <select id="pwTemplateSelect" style="margin-top: 4px;"></select>
+        </div>
 
-      <div style="display: flex; justify-content: flex-end; margin-top: 14px;">
-        <button class="btn btn-primary btn-sm" onclick="closeGroupModal()">Close</button>
+        <div style="background: #F8FAFC; border: 1px dashed #CBD5E1; padding: 12px; border-radius: 8px; font-size: 12px; margin-bottom: 16px;">
+          <label style="font-weight: 600;">Chrome Session Mode:</label>
+          <div style="margin-top: 6px; display: flex; flex-direction: column; gap: 6px;">
+            <label style="display: flex; align-items: flex-start; gap: 6px; cursor: pointer;">
+              <input type="radio" name="pwMode" value="profile" checked onchange="togglePwMode(this.value)" style="margin-top: 2px;" />
+              <span><strong>Persistent Dedicated Chrome Profile</strong><br/><span style="color: #666; font-size: 11px;">Opens Chrome with saved login (./chrome-wa-profile). Scan QR once, stays logged in permanently.</span></span>
+            </label>
+            <label style="display: flex; align-items: flex-start; gap: 6px; cursor: pointer;">
+              <input type="radio" name="pwMode" value="cdp" onchange="togglePwMode(this.value)" style="margin-top: 2px;" />
+              <span><strong>Attach to Existing Chrome (Port 9222)</strong><br/><span style="color: #666; font-size: 11px;">Connects to Chrome already running on your desktop with remote debugging.</span></span>
+            </label>
+          </div>
+          <div id="pwCdpHint" style="display: none; margin-top: 8px; font-size: 11px; color: #334155; background: #E2E8F0; padding: 8px; border-radius: 6px;">
+            Run this in Terminal to launch Chrome with port 9222:<br/>
+            <code>/Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --remote-debugging-port=9222</code>
+          </div>
+        </div>
+
+        <!-- Live Progress Box -->
+        <div id="pwProgressBox" style="display: none; background: #F1F5F9; border: 1px solid #CBD5E1; padding: 14px; border-radius: 8px; margin-bottom: 14px;">
+          <div style="display: flex; justify-content: space-between; font-size: 12px; font-weight: 700; margin-bottom: 6px;">
+            <span id="pwStatusTitle">🤖 Initializing Chrome...</span>
+            <span id="pwCounter">0 / 0</span>
+          </div>
+          <div style="width: 100%; height: 8px; background: #E2E8F0; border-radius: 4px; overflow: hidden; margin-bottom: 10px;">
+            <div id="pwProgressBar" style="width: 0%; height: 100%; background: #25D366; transition: width 0.3s;"></div>
+          </div>
+          <div id="pwLiveLog" style="max-height: 130px; overflow-y: auto; font-family: monospace; font-size: 11px; color: #334155; line-height: 1.6; background: white; padding: 8px; border-radius: 6px; border: 1px solid #E2E8F0;"></div>
+        </div>
+
+        <div style="display: flex; justify-content: flex-end; gap: 8px;">
+          <button class="btn btn-secondary btn-sm" onclick="closePlaywrightModal()">Close</button>
+          <button class="btn btn-primary btn-sm" id="startPwBtn" onclick="startPlaywrightDrafting()">
+            🚀 Start 1-Click Auto-Drafting (Safe: No Send)
+          </button>
+        </div>
       </div>
     </div>
   </div>
 
-  <!-- MODAL: Cloud Database Settings (Vercel Postgres & Supabase) -->
+  <!-- MODAL: Cloud Database Settings -->
   <div id="dbModal" class="modal-backdrop">
     <div class="modal">
       <div class="modal-header">
@@ -1133,23 +1220,23 @@ app.get('/', (req, res) => {
       </div>
       <div class="modal-body">
         <p style="font-size: 13px; color: #555; margin-bottom: 14px; line-height: 1.5;">
-          <strong>Privacy Rule Enforced:</strong> Only <strong>Contact Name &amp; Phone</strong> are stored permanently in the database. Templates and message text are temporary.
+          <strong>Privacy Rule:</strong> Only <strong>Contact Name &amp; Phone</strong> are stored permanently. Templates and message text are temporary.
         </p>
 
-        <!-- Option 1: Vercel Postgres -->
+        <!-- Vercel Postgres -->
         <div style="background: #F8FAFC; border: 1.5px solid #E2E8F0; padding: 14px; border-radius: 8px; margin-bottom: 16px;">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
             <strong style="font-size: 13px;">▲ Vercel Postgres (Neon)</strong>
             <span style="font-size: 11px; background: #000; color: #fff; padding: 2px 7px; border-radius: 4px;">Recommended</span>
           </div>
           <p style="font-size: 12px; color: #666; margin-bottom: 8px;">
-            When deployed to Vercel, this connects automatically via <code>POSTGRES_URL</code>. Or paste your connection string below:
+            When deployed to Vercel, this connects automatically via <code>POSTGRES_URL</code>. Or paste connection string:
           </p>
           <input type="text" id="postgresUrlInput" placeholder="postgres://default:...@...neon.tech:5432/verceldb?sslmode=require" style="font-size: 12px;" />
           <button class="btn btn-secondary btn-sm" style="margin-top: 8px;" onclick="savePostgresUrl()">Connect Vercel Postgres</button>
         </div>
 
-        <!-- Option 2: Supabase -->
+        <!-- Supabase -->
         <div style="background: #F8FAFC; border: 1.5px solid #E2E8F0; padding: 14px; border-radius: 8px;">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
             <strong style="font-size: 13px;">⚡ Supabase Database (Realtime Sync)</strong>
@@ -1185,7 +1272,6 @@ app.get('/', (req, res) => {
           Templates are <strong>temporary/session-based</strong> and NOT permanently saved to the database.
         </p>
 
-        <!-- Template selector / Create new -->
         <div style="display: flex; gap: 10px; margin-bottom: 16px; align-items: center;">
           <select id="editTplPicker" onchange="loadTemplateIntoEditor(this.value)" style="flex: 1;"></select>
           <button class="btn btn-secondary btn-sm" onclick="createNewTemplateForm()">+ New Template</button>
@@ -1208,7 +1294,6 @@ app.get('/', (req, res) => {
             <textarea id="tplTextInput" placeholder="Write your template text here..."></textarea>
           </div>
 
-          <!-- Media Attachment Section -->
           <div style="margin-top: 12px; padding-top: 12px; border-top: 1px dashed #CBD5E1;">
             <label style="font-weight: 600; font-size: 12px; text-transform: uppercase;">Attach Photo / Video (Optional)</label>
             
@@ -1222,7 +1307,6 @@ app.get('/', (req, res) => {
               <input type="text" id="tplMediaUrlInput" oninput="updateMediaPreviewInEditor()" placeholder="https://example.com/photo.jpg or /uploads/..." style="margin-top: 3px; font-size: 13px;" />
             </div>
 
-            <!-- Media Preview in Editor -->
             <div id="mediaEditorPreviewBox" style="margin-top: 10px; display: none;">
               <div style="font-size: 11px; font-weight: 600; color: #555; margin-bottom: 4px;">Media Preview:</div>
               <div id="mediaEditorPreviewContent"></div>
@@ -1237,71 +1321,6 @@ app.get('/', (req, res) => {
             <button class="btn btn-primary btn-sm" onclick="saveCurrentTemplate()">💾 Save Template</button>
           </div>
         </div>
-  <!-- MODAL: Playwright Semi-Automation Draft Bot -->
-  <div id="playwrightModal" class="modal-backdrop">
-    <div class="modal" style="max-width: 640px;">
-      <div class="modal-header">
-        <div class="modal-title">🤖 WhatsApp Auto-Draft Bot (Playwright)</div>
-        <button class="close-btn" onclick="closePlaywrightModal()">&times;</button>
-      </div>
-      <div class="modal-body">
-        <div style="background: #FEF3C7; border: 1.5px solid #F59E0B; padding: 12px; border-radius: 8px; font-size: 13px; color: #92400E; margin-bottom: 14px; line-height: 1.5;">
-          <strong>🔒 Semi-Automation Safety Rule:</strong>
-          This bot opens each chat and types the text into the box as an <strong>unsent draft</strong>. It will <strong>NEVER press Enter or click Send</strong>. The drafts stay ready in your WhatsApp account so you can manually tap Send on your mobile phone or PC!
-        </div>
-
-        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px;">
-          <div>
-            <label style="font-size: 11px; font-weight: 700; text-transform: uppercase; color: #555;">Target Group</label>
-            <select id="pwGroupSelect" style="margin-top: 4px;"></select>
-          </div>
-          <div>
-            <label style="font-size: 11px; font-weight: 700; text-transform: uppercase; color: #555;">Template</label>
-            <select id="pwTemplateSelect" style="margin-top: 4px;"></select>
-          </div>
-        </div>
-
-        <div style="margin-bottom: 14px;">
-          <label style="font-size: 11px; font-weight: 700; text-transform: uppercase; color: #555;">Max Contacts</label>
-          <input type="number" id="pwLimitInput" value="50" min="1" max="200" style="margin-top: 4px; width: 120px; padding: 8px 10px; border: 1.5px solid #D1D7DB; border-radius: 6px;" />
-        </div>
-
-        <div style="background: #F8FAFC; border: 1px dashed #CBD5E1; padding: 12px; border-radius: 8px; font-size: 12px; margin-bottom: 16px;">
-          <label style="font-weight: 600;">Chrome Session Mode:</label>
-          <div style="margin-top: 6px; display: flex; flex-direction: column; gap: 6px;">
-            <label style="display: flex; align-items: flex-start; gap: 6px; cursor: pointer;">
-              <input type="radio" name="pwMode" value="profile" checked onchange="togglePwMode(this.value)" style="margin-top: 2px;" />
-              <span><strong>Persistent Dedicated Chrome Profile</strong><br/><span style="color: #666; font-size: 11px;">Opens Chrome with dedicated profile (./chrome-wa-profile). Scan QR once, stays logged in permanently.</span></span>
-            </label>
-            <label style="display: flex; align-items: flex-start; gap: 6px; cursor: pointer;">
-              <input type="radio" name="pwMode" value="cdp" onchange="togglePwMode(this.value)" style="margin-top: 2px;" />
-              <span><strong>Attach to Existing Chrome (Port 9222)</strong><br/><span style="color: #666; font-size: 11px;">Connects to Chrome already open on your desktop with remote debugging.</span></span>
-            </label>
-          </div>
-          <div id="pwCdpHint" style="display: none; margin-top: 8px; font-size: 11px; color: #334155; background: #E2E8F0; padding: 8px; border-radius: 6px;">
-            Run this in Terminal to launch Chrome with port 9222:<br/>
-            <code>/Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --remote-debugging-port=9222</code>
-          </div>
-        </div>
-
-        <!-- Live Progress Box -->
-        <div id="pwProgressBox" style="display: none; background: #F1F5F9; border: 1px solid #CBD5E1; padding: 14px; border-radius: 8px; margin-bottom: 14px;">
-          <div style="display: flex; justify-content: space-between; font-size: 12px; font-weight: 700; margin-bottom: 6px;">
-            <span id="pwStatusTitle">🤖 Initializing Chrome...</span>
-            <span id="pwCounter">0 / 0</span>
-          </div>
-          <div style="width: 100%; height: 8px; background: #E2E8F0; border-radius: 4px; overflow: hidden; margin-bottom: 10px;">
-            <div id="pwProgressBar" style="width: 0%; height: 100%; background: #25D366; transition: width 0.3s;"></div>
-          </div>
-          <div id="pwLiveLog" style="max-height: 130px; overflow-y: auto; font-family: monospace; font-size: 11px; color: #334155; line-height: 1.6; background: white; padding: 8px; border-radius: 6px; border: 1px solid #E2E8F0;"></div>
-        </div>
-
-        <div style="display: flex; justify-content: flex-end; gap: 8px;">
-          <button class="btn btn-secondary btn-sm" onclick="closePlaywrightModal()">Close</button>
-          <button class="btn btn-primary btn-sm" id="startPwBtn" onclick="startPlaywrightDrafting()">
-            🚀 Start Auto-Drafting (Safe: No Send)
-          </button>
-        </div>
       </div>
     </div>
   </div>
@@ -1311,11 +1330,9 @@ app.get('/', (req, res) => {
   <script>
     let state = {
       leads: [],
-      groups: [],
       templates: {},
-      selectedGroup: 'All',
       globalTemplate: 'welcome',
-      sheetStatus: {},
+      sheetStatus: { tabs: [], currentGid: '0', currentTabName: 'Main Sheet' },
       activeFilter: 'all',
       defaultCountryCode: '91',
       supabaseConfig: { isConfigured: false, url: '', anonKey: '' },
@@ -1323,6 +1340,7 @@ app.get('/', (req, res) => {
     };
 
     let supabaseClient = null;
+    let pwPollTimer = null;
 
     function showToast(msg) {
       const toast = document.getElementById('toast');
@@ -1358,7 +1376,7 @@ app.get('/', (req, res) => {
       const st = state.sheetStatus;
       if (st.isConnected) {
         badge.className = 'status-badge status-connected';
-        badge.innerHTML = '🟢 Connected (' + state.leads.length + ' contacts loaded)';
+        badge.innerHTML = '🟢 Connected &bull; Tab: ' + (st.currentTabName || 'Sheet') + ' (' + state.leads.length + ' contacts)';
       } else if (st.error) {
         badge.className = 'status-badge status-error';
         badge.innerHTML = '🔴 ' + (st.error.length > 50 ? st.error.slice(0, 48) + '...' : st.error);
@@ -1370,25 +1388,61 @@ app.get('/', (req, res) => {
     }
 
     function updateStats() {
-      const groupLeads = getFilteredByGroup();
-      const total = groupLeads.length;
-      const sent = groupLeads.filter(l => l.isSent).length;
+      const total = state.leads.length;
+      const sent = state.leads.filter(l => l.isSent).length;
       const pending = total - sent;
 
       document.getElementById('totalLeadsCount').innerText = total;
       document.getElementById('sentCount').innerText = sent;
       document.getElementById('pendingCount').innerText = pending;
+      document.getElementById('tabCountBadge').innerText = total + ' contacts';
     }
 
-    function getFilteredByGroup() {
-      if (state.selectedGroup === 'All') return state.leads;
-      return state.leads.filter(l => (l.group || 'General').toLowerCase() === state.selectedGroup.toLowerCase());
+    function renderTabsBar() {
+      const container = document.getElementById('sheetTabsList');
+      const dropdown = document.getElementById('activeTabDropdown');
+      const tabs = state.sheetStatus.tabs || [{ name: 'Main Sheet', gid: '0' }];
+      const currentGid = String(state.sheetStatus.currentGid || '0');
+
+      // Pills list in Google Sheet section
+      container.innerHTML = tabs.map(t => \`
+        <div class="sheet-tab-pill \${String(t.gid) === currentGid ? 'active' : ''}" onclick="switchSheetTab('\${t.gid}')">
+          📑 \${t.name}
+        </div>
+      \`).join('');
+
+      // Dropdown in Campaign Controller
+      dropdown.innerHTML = tabs.map(t => \`
+        <option value="\${t.gid}" \${String(t.gid) === currentGid ? 'selected' : ''}>
+          📑 \${t.name}
+        </option>
+      \`).join('');
     }
 
-    function onGroupChanged(groupName) {
-      state.selectedGroup = groupName;
-      updateStats();
-      renderTable();
+    async function switchSheetTab(gid) {
+      if (String(gid) === String(state.sheetStatus.currentGid)) return;
+
+      showToast('Loading tab data...');
+      try {
+        const res = await fetch('/api/sheet/switch-tab', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ gid })
+        });
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error || 'Failed to switch tab');
+
+        state.sheetStatus = data.sheetStatus;
+        state.leads = data.leads;
+        updateBadge();
+        renderTabsBar();
+        updateStats();
+        applyTemplateToAll(false);
+        renderTable();
+        showToast('Switched to tab: ' + data.tabName + ' (' + data.leads.length + ' contacts)');
+      } catch (err) {
+        alert('Could not switch tab: ' + err.message);
+      }
     }
 
     function onGlobalTemplateChanged(tplKey) {
@@ -1398,13 +1452,12 @@ app.get('/', (req, res) => {
     }
 
     function applyTemplateToAll(showToastAlert = true) {
-      const groupLeads = getFilteredByGroup();
-      groupLeads.forEach(l => {
+      state.leads.forEach(l => {
         l.selectedTemplate = state.globalTemplate;
       });
       renderTable();
       if (showToastAlert) {
-        showToast('Applied template "' + (state.templates[state.globalTemplate]?.title || state.globalTemplate) + '" to all ' + groupLeads.length + ' contacts.');
+        showToast('Applied template to all ' + state.leads.length + ' contacts.');
       }
     }
 
@@ -1426,15 +1479,6 @@ app.get('/', (req, res) => {
       renderTable();
     }
 
-    function renderGroupDropdown() {
-      const select = document.getElementById('groupSelect');
-      select.innerHTML = state.groups.map(g => \`
-        <option value="\${g.name}" \${g.name === state.selectedGroup ? 'selected' : ''}>
-          \${g.name === 'All' ? '🌐 All Contacts' : '📁 Group: ' + g.name} (\${g.count})
-        </option>
-      \`).join('');
-    }
-
     function renderGlobalTemplateDropdown() {
       const select = document.getElementById('globalTemplateSelect');
       const keys = Object.keys(state.templates);
@@ -1453,9 +1497,8 @@ app.get('/', (req, res) => {
     function renderTable() {
       const tbody = document.getElementById('tableBody');
       const search = (document.getElementById('searchInput').value || '').toLowerCase().trim();
-      const groupLeads = getFilteredByGroup();
 
-      const filtered = groupLeads.filter(lead => {
+      const filtered = state.leads.filter(lead => {
         if (state.activeFilter === 'sent' && !lead.isSent) return false;
         if (state.activeFilter === 'pending' && lead.isSent) return false;
 
@@ -1463,14 +1506,13 @@ app.get('/', (req, res) => {
           const matchName = (lead.name || '').toLowerCase().includes(search);
           const matchPhone = (lead.phone || '').toLowerCase().includes(search);
           const matchOrder = (lead.orderId || '').toLowerCase().includes(search);
-          const matchGroup = (lead.group || '').toLowerCase().includes(search);
-          if (!matchName && !matchPhone && !matchOrder && !matchGroup) return false;
+          if (!matchName && !matchPhone && !matchOrder) return false;
         }
         return true;
       });
 
       if (filtered.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; padding: 32px; color: #888;">No contacts found for selected group & filter.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; padding: 32px; color: #888;">No contacts found in current sheet tab.</td></tr>';
         return;
       }
 
@@ -1523,7 +1565,7 @@ app.get('/', (req, res) => {
             <td>
               <div class="lead-name">\${lead.name || 'Unnamed'}</div>
               <div class="lead-phone">\${lead.phone || '<span style="color:#e53e3e">No Phone</span>'}</div>
-              <span class="group-pill">📁 \${lead.group || 'General'}</span>
+              <span class="tab-tag">📑 \${lead.tab || state.sheetStatus.currentTabName || 'Tab'}</span>
             </td>
             <td>
               \${lead.orderId ? '<span class="meta-tag">#' + lead.orderId + '</span>' : ''}
@@ -1543,7 +1585,6 @@ app.get('/', (req, res) => {
                 <a href="\${waLink}" target="_blank" onclick="handleSendClick(\${lead.id}, '\${tplObj.mediaUrl || ''}')" class="btn-wa \${lead.isSent ? 'sent' : ''}">
                   <span>\${lead.isSent ? 'Resend' : 'Send'}</span> 💬
                 </a>
-                \${tplObj.mediaUrl && tplObj.mediaType !== 'video' ? \`<span style="font-size: 10px; color: #666;">(Image copied on send)</span>\` : ''}
               </div>
             </td>
           </tr>
@@ -1562,7 +1603,7 @@ app.get('/', (req, res) => {
       markSent(leadId);
       if (mediaUrl && !mediaUrl.match(/\\.(mp4|mov|webm)$/i)) {
         await copyImageToClipboard(mediaUrl, false);
-        showToast('Image copied to clipboard! In WhatsApp Web, press Cmd+V (or Ctrl+V) to paste the image.');
+        showToast('Image copied to clipboard! Paste in WhatsApp with Cmd+V.');
       }
     }
 
@@ -1579,7 +1620,6 @@ app.get('/', (req, res) => {
         ]);
         if (showToastMsg) showToast('Image copied to clipboard! Paste it into WhatsApp with Cmd+V / Ctrl+V.');
       } catch (err) {
-        console.warn('Direct image clipboard copy failed:', err);
         if (showToastMsg) showToast('Image link ready: ' + imageUrl);
       }
     }
@@ -1651,9 +1691,8 @@ app.get('/', (req, res) => {
 
         state.sheetStatus = data.sheetStatus;
         state.leads = data.leads;
-        state.groups = data.groups;
         updateBadge();
-        renderGroupDropdown();
+        renderTabsBar();
         updateStats();
         applyTemplateToAll(false);
         renderTable();
@@ -1664,7 +1703,7 @@ app.get('/', (req, res) => {
         updateBadge();
       } finally {
         btn.disabled = false;
-        btn.innerHTML = '<span>🔗 Connect & Sync</span>';
+        btn.innerHTML = '<span>🔗 Connect Spreadsheet</span>';
       }
     }
 
@@ -1680,9 +1719,8 @@ app.get('/', (req, res) => {
 
         state.sheetStatus = data.sheetStatus;
         state.leads = data.leads;
-        state.groups = data.groups;
         updateBadge();
-        renderGroupDropdown();
+        renderTabsBar();
         updateStats();
         applyTemplateToAll(false);
         renderTable();
@@ -1691,340 +1729,19 @@ app.get('/', (req, res) => {
         alert('Sync error: ' + err.message);
       } finally {
         btn.disabled = false;
-        btn.innerHTML = '<span>🔄 Refresh</span>';
+        btn.innerHTML = '<span>🔄 Refresh Tab</span>';
       }
     }
 
-    // --- MODAL: GROUP NUMBERS INSPECTOR ---
-    function openGroupModal() {
-      const modal = document.getElementById('groupModal');
-      const title = document.getElementById('groupModalTitle');
-      const body = document.getElementById('groupModalBody');
-      const groupLeads = getFilteredByGroup();
-
-      title.innerHTML = '👥 Group: <strong>' + state.selectedGroup + '</strong> (' + groupLeads.length + ' Contacts)';
-      body.innerHTML = groupLeads.map(l => \`
-        <tr>
-          <td><strong>\${l.name}</strong></td>
-          <td style="font-family: monospace; color: #008069;">\${cleanPhone(l.phone)}</td>
-          <td>\${l.isSent ? '<span style="color:#0E702A; font-weight:600;">Sent</span>' : '<span style="color:#64748B;">Pending</span>'}</td>
-        </tr>
-      \`).join('');
-
-      modal.classList.add('open');
-    }
-
-    function closeGroupModal() {
-      document.getElementById('groupModal').classList.remove('open');
-    }
-
-    function copyGroupNumbers(separator) {
-      const groupLeads = getFilteredByGroup();
-      const numbers = groupLeads
-        .map(l => cleanPhone(l.phone))
-        .filter(p => p.length >= 7);
-
-      if (numbers.length === 0) {
-        alert('No valid phone numbers found in this group.');
-        return;
-      }
-
-      const text = numbers.join(separator === '\\n' ? '\\n' : ', ');
-      navigator.clipboard.writeText(text);
-      showToast('Copied ' + numbers.length + ' phone numbers to clipboard!');
-    }
-
-    // --- MODAL: DATABASE SETTINGS ---
-    function openDatabaseModal() {
-      if (state.supabaseConfig.url) {
-        document.getElementById('sbUrlInput').value = state.supabaseConfig.url;
-      }
-      if (state.supabaseConfig.anonKey) {
-        document.getElementById('sbKeyInput').value = state.supabaseConfig.anonKey;
-      }
-      document.getElementById('dbModal').classList.add('open');
-    }
-
-    function closeDatabaseModal() {
-      document.getElementById('dbModal').classList.remove('open');
-    }
-
-    async function savePostgresUrl() {
-      const postgresUrl = document.getElementById('postgresUrlInput').value.trim();
-      if (!postgresUrl) {
-        alert('Please enter a PostgreSQL connection string.');
-        return;
-      }
-
-      try {
-        const res = await fetch('/api/postgres/config', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ postgresUrl })
-        });
-        const data = await res.json();
-        if (!data.success) throw new Error(data.error || 'Connection failed');
-
-        state.dbStatus = data.dbStatus;
-        updateDbButton();
-        closeDatabaseModal();
-        showToast(data.message);
-      } catch (err) {
-        alert('Vercel Postgres error: ' + err.message);
-      }
-    }
-
-    async function saveSupabaseSettings() {
-      const url = document.getElementById('sbUrlInput').value.trim();
-      const anonKey = document.getElementById('sbKeyInput').value.trim();
-
-      if (!url || !anonKey) {
-        alert('Please enter both Supabase URL and Anon Key.');
-        return;
-      }
-
-      try {
-        const res = await fetch('/api/supabase/config', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url, anonKey })
-        });
-        const data = await res.json();
-        if (!data.success) throw new Error(data.error || 'Failed to connect');
-
-        state.supabaseConfig = data.supabaseConfig;
-        state.dbStatus = data.dbStatus;
-        updateDbButton();
-        closeDatabaseModal();
-        initSupabaseRealtime();
-        showToast(data.message);
-      } catch (err) {
-        alert('Supabase connection error: ' + err.message);
-      }
-    }
-
-    function updateDbButton() {
-      const btnText = document.getElementById('dbStatusText');
-      const icon = document.getElementById('dbIcon');
-      const db = state.dbStatus || {};
-
-      if (db.provider === 'vercel_postgres') {
-        btnText.innerText = 'Vercel Postgres Active';
-        icon.innerText = '▲';
-      } else if (db.provider === 'supabase') {
-        btnText.innerText = 'Supabase Realtime';
-        icon.innerText = '⚡';
-      } else {
-        btnText.innerText = 'Connect Cloud DB';
-        icon.innerText = '☁️';
-      }
-    }
-
-    function initSupabaseRealtime() {
-      if (!state.supabaseConfig.isConfigured || !window.supabase) return;
-
-      try {
-        supabaseClient = window.supabase.createClient(
-          state.supabaseConfig.url,
-          state.supabaseConfig.anonKey
-        );
-
-        supabaseClient
-          .channel('public:contacts')
-          .on('postgres_changes', { event: '*', schema: 'public', table: 'contacts' }, payload => {
-            console.log('⚡ Supabase Realtime update:', payload);
-            if (payload.new && payload.new.phone) {
-              const matched = state.leads.find(l => cleanPhone(l.phone) === payload.new.phone);
-              if (matched) {
-                matched.isSent = !!payload.new.is_sent;
-                updateStats();
-                renderTable();
-              }
-            }
-          })
-          .subscribe();
-      } catch (err) {
-        console.warn('Supabase Realtime notice:', err);
-      }
-    }
-
-    // --- MODAL: TEMPLATE & MEDIA MANAGER ---
-    let editingTemplateKey = null;
-
-    function openTemplatesModal() {
-      renderTemplateEditorPicker();
-      renderAvailableTags();
-      const keys = Object.keys(state.templates);
-      if (keys.length > 0) {
-        loadTemplateIntoEditor(keys[0]);
-      } else {
-        createNewTemplateForm();
-      }
-      document.getElementById('templatesModal').classList.add('open');
-    }
-
-    function closeTemplatesModal() {
-      document.getElementById('templatesModal').classList.remove('open');
-    }
-
-    function renderTemplateEditorPicker() {
-      const picker = document.getElementById('editTplPicker');
-      picker.innerHTML = Object.entries(state.templates).map(([k, tpl]) => \`
-        <option value="\${k}">\${tpl.title} (\${k})\${tpl.mediaUrl ? ' 🖼️' : ''}</option>
-      \`).join('');
-    }
-
-    function renderAvailableTags() {
-      const container = document.getElementById('availableTags');
-      const headers = state.sheetStatus.headers || ['name', 'phone', 'group', 'orderId', 'status', 'time'];
-      container.innerHTML = '<span style="font-size: 11px; color:#555;">Click tag to insert:</span> ' + headers.map(h => \`
-        <span class="tag-pill" onclick="insertTagIntoText('{{\${h}}}')">{{\${h}}}</span>
-      \`).join(' ');
-    }
-
-    function insertTagIntoText(tag) {
-      const textarea = document.getElementById('tplTextInput');
-      const start = textarea.selectionStart;
-      const end = textarea.selectionEnd;
-      textarea.value = textarea.value.substring(0, start) + tag + textarea.value.substring(end);
-      textarea.selectionStart = textarea.selectionEnd = start + tag.length;
-      textarea.focus();
-    }
-
-    function loadTemplateIntoEditor(key) {
-      editingTemplateKey = key;
-      document.getElementById('editTplPicker').value = key;
-      const tpl = state.templates[key] || { title: '', text: '', mediaUrl: '', mediaType: '' };
-
-      document.getElementById('tplKeyInput').value = key;
-      document.getElementById('tplKeyInput').disabled = true;
-      document.getElementById('tplTitleInput').value = tpl.title || '';
-      document.getElementById('tplTextInput').value = tpl.text || '';
-      document.getElementById('tplMediaUrlInput').value = tpl.mediaUrl || '';
-      document.getElementById('deleteTplBtn').style.display = 'inline-flex';
-
-      updateMediaPreviewInEditor();
-    }
-
-    function createNewTemplateForm() {
-      editingTemplateKey = null;
-      document.getElementById('tplKeyInput').value = '';
-      document.getElementById('tplKeyInput').disabled = false;
-      document.getElementById('tplTitleInput').value = '';
-      document.getElementById('tplTextInput').value = '';
-      document.getElementById('tplMediaUrlInput').value = '';
-      document.getElementById('deleteTplBtn').style.display = 'none';
-      updateMediaPreviewInEditor();
-    }
-
-    function updateMediaPreviewInEditor() {
-      const url = document.getElementById('tplMediaUrlInput').value.trim();
-      const previewBox = document.getElementById('mediaEditorPreviewBox');
-      const content = document.getElementById('mediaEditorPreviewContent');
-
-      if (!url) {
-        previewBox.style.display = 'none';
-        content.innerHTML = '';
-        return;
-      }
-
-      previewBox.style.display = 'block';
-      const isVideo = url.match(/\\.(mp4|mov|webm)$/i);
-      if (isVideo) {
-        content.innerHTML = \`<video src="\${url}" controls style="max-width: 100%; max-height: 140px; border-radius: 6px;"></video>\`;
-      } else {
-        content.innerHTML = \`<img src="\${url}" style="max-width: 100%; max-height: 140px; border-radius: 6px; object-fit: contain;" alt="Preview" />\`;
-      }
-    }
-
-    async function uploadSelectedMedia() {
-      const fileInput = document.getElementById('mediaFileInput');
-      if (!fileInput.files || fileInput.files.length === 0) {
-        alert('Please choose a file to upload first.');
-        return;
-      }
-
-      const formData = new FormData();
-      formData.append('mediaFile', fileInput.files[0]);
-
-      try {
-        showToast('Uploading media file...');
-        const res = await fetch('/api/upload-media', {
-          method: 'POST',
-          body: formData
-        });
-        const data = await res.json();
-        if (!data.success) throw new Error(data.error || 'Upload failed');
-
-        document.getElementById('tplMediaUrlInput').value = data.url;
-        updateMediaPreviewInEditor();
-        showToast('Media uploaded successfully!');
-      } catch (err) {
-        alert('Media upload failed: ' + err.message);
-      }
-    }
-
-    async function saveCurrentTemplate() {
-      const key = (document.getElementById('tplKeyInput').value || '').trim();
-      const title = (document.getElementById('tplTitleInput').value || '').trim();
-      const text = (document.getElementById('tplTextInput').value || '').trim();
-      const mediaUrl = (document.getElementById('tplMediaUrlInput').value || '').trim();
-
-      if (!key) {
-        alert('Please enter a Template Key.');
-        return;
-      }
-      if (!text) {
-        alert('Please enter Template Message Text.');
-        return;
-      }
-
-      try {
-        const res = await fetch('/api/templates/save-single', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ key, title, text, mediaUrl })
-        });
-        const data = await res.json();
-        if (!data.success) throw new Error(data.error || 'Failed to save template');
-
-        state.templates = data.templates;
-        renderGlobalTemplateDropdown();
-        renderTemplateEditorPicker();
-        renderTable();
-        closeTemplatesModal();
-        showToast('Template saved for this session!');
-      } catch (e) {
-        alert('Error: ' + e.message);
-      }
-    }
-
-    async function deleteCurrentTemplate() {
-      if (!editingTemplateKey) return;
-      if (!confirm('Are you sure you want to delete template "' + editingTemplateKey + '"?')) return;
-
-      try {
-        const res = await fetch('/api/templates/' + encodeURIComponent(editingTemplateKey), { method: 'DELETE' });
-        const data = await res.json();
-        state.templates = data.templates;
-        renderGlobalTemplateDropdown();
-        renderTable();
-        closeTemplatesModal();
-        showToast('Template deleted.');
-      } catch (e) {
-        alert('Delete failed: ' + e.message);
-      }
-    }
-
-    // --- Playwright Modal JS ---
-    let pwPollTimer = null;
-
-    function openPlaywrightModal() {
-      const grpSel = document.getElementById('pwGroupSelect');
-      grpSel.innerHTML = state.groups.map(g => \`<option value="\${g.name}">\${g.name} (\${g.count})</option>\`).join('');
+    // --- 1-CLICK PLAYWRIGHT MODAL ---
+    function open1ClickDraftModal() {
+      document.getElementById('pwModalTabName').innerText = state.sheetStatus.currentTabName || 'Current Tab';
+      document.getElementById('pwModalContactCount').innerText = state.leads.length;
 
       const tplSel = document.getElementById('pwTemplateSelect');
-      tplSel.innerHTML = Object.entries(state.templates).map(([k, t]) => \`<option value="\${k}">\${t.title}</option>\`).join('');
+      tplSel.innerHTML = Object.entries(state.templates).map(([k, t]) => \`
+        <option value="\${k}" \${k === state.globalTemplate ? 'selected' : ''}>\${t.title}</option>
+      \`).join('');
 
       document.getElementById('playwrightModal').classList.add('open');
     }
@@ -2039,9 +1756,7 @@ app.get('/', (req, res) => {
     }
 
     async function startPlaywrightDrafting() {
-      const group = document.getElementById('pwGroupSelect').value;
       const templateKey = document.getElementById('pwTemplateSelect').value;
-      const limit = parseInt(document.getElementById('pwLimitInput').value || '50', 10);
       const useExistingCdp = document.querySelector('input[name="pwMode"]:checked').value === 'cdp';
 
       const btn = document.getElementById('startPwBtn');
@@ -2049,13 +1764,17 @@ app.get('/', (req, res) => {
       btn.innerText = 'Drafting in progress...';
 
       document.getElementById('pwProgressBox').style.display = 'block';
-      document.getElementById('pwLiveLog').innerHTML = '<div style="color:#008069;">🚀 Starting Playwright Chrome session...</div>';
+      document.getElementById('pwLiveLog').innerHTML = '<div style="color:#008069;">🚀 Starting Playwright Chrome session for tab: ' + state.sheetStatus.currentTabName + '...</div>';
 
       try {
         const res = await fetch('/api/playwright/start-drafts', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ group, templateKey, limit, useExistingCdp })
+          body: JSON.stringify({
+            templateKey,
+            limit: state.leads.length,
+            useExistingCdp
+          })
         });
         const data = await res.json();
         if (!data.success) throw new Error(data.error || 'Failed to start');
@@ -2065,7 +1784,7 @@ app.get('/', (req, res) => {
       } catch (err) {
         alert('Could not start Playwright: ' + err.message);
         btn.disabled = false;
-        btn.innerText = '🚀 Start Auto-Drafting (Safe: No Send)';
+        btn.innerText = '🚀 Start 1-Click Auto-Drafting (Safe: No Send)';
       }
     }
 
@@ -2087,9 +1806,9 @@ app.get('/', (req, res) => {
         if (st.isRunning) {
           title.innerText = '🤖 Drafting: ' + (st.currentContact || 'Loading...');
         } else if (st.status === 'completed') {
-          title.innerText = '✅ Completed! All drafts ready.';
+          title.innerText = '✅ Completed! All ' + st.total + ' chats drafted for tab "' + (st.tabName || '') + '".';
           btn.disabled = false;
-          btn.innerText = '🚀 Start Again';
+          btn.innerText = '🚀 Draft Again';
           clearInterval(pwPollTimer);
           showToast('Drafting complete! Open WhatsApp on phone/PC and tap Send.');
         } else if (st.status === 'error') {
@@ -2100,7 +1819,7 @@ app.get('/', (req, res) => {
         }
 
         if (st.history && st.history.length > 0) {
-          log.innerHTML = st.history.slice(0, 20).map(h => {
+          log.innerHTML = st.history.slice(0, 25).map(h => {
             const icon = h.status === 'drafted' ? '✅' : (h.status === 'processing' ? '⏳' : '⚠️');
             return '<div>' + icon + ' [' + h.time + '] ' + h.contact + ' (' + h.phone + '): ' + h.status + '</div>';
           }).join('');
@@ -2110,6 +1829,212 @@ app.get('/', (req, res) => {
       }
     }
 
+    // --- DATABASE MODAL ---
+    function openDatabaseModal() {
+      if (state.supabaseConfig.url) document.getElementById('sbUrlInput').value = state.supabaseConfig.url;
+      if (state.supabaseConfig.anonKey) document.getElementById('sbKeyInput').value = state.supabaseConfig.anonKey;
+      document.getElementById('dbModal').classList.add('open');
+    }
+    function closeDatabaseModal() { document.getElementById('dbModal').classList.remove('open'); }
+
+    async function savePostgresUrl() {
+      const postgresUrl = document.getElementById('postgresUrlInput').value.trim();
+      if (!postgresUrl) return alert('Please enter a PostgreSQL URL.');
+      try {
+        const res = await fetch('/api/postgres/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ postgresUrl })
+        });
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error);
+        state.dbStatus = data.dbStatus;
+        updateDbButton();
+        closeDatabaseModal();
+        showToast(data.message);
+      } catch (err) { alert('Error: ' + err.message); }
+    }
+
+    async function saveSupabaseSettings() {
+      const url = document.getElementById('sbUrlInput').value.trim();
+      const anonKey = document.getElementById('sbKeyInput').value.trim();
+      if (!url || !anonKey) return alert('Enter Supabase URL and Anon Key.');
+      try {
+        const res = await fetch('/api/supabase/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url, anonKey })
+        });
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error);
+        state.supabaseConfig = data.supabaseConfig;
+        state.dbStatus = data.dbStatus;
+        updateDbButton();
+        closeDatabaseModal();
+        initSupabaseRealtime();
+        showToast(data.message);
+      } catch (err) { alert('Error: ' + err.message); }
+    }
+
+    function updateDbButton() {
+      const btnText = document.getElementById('dbStatusText');
+      const icon = document.getElementById('dbIcon');
+      const db = state.dbStatus || {};
+      if (db.provider === 'vercel_postgres') {
+        btnText.innerText = 'Vercel Postgres Active';
+        icon.innerText = '▲';
+      } else if (db.provider === 'supabase') {
+        btnText.innerText = 'Supabase Realtime';
+        icon.innerText = '⚡';
+      } else {
+        btnText.innerText = 'Connect Cloud DB';
+        icon.innerText = '☁️';
+      }
+    }
+
+    function initSupabaseRealtime() {
+      if (!state.supabaseConfig.isConfigured || !window.supabase) return;
+      try {
+        supabaseClient = window.supabase.createClient(state.supabaseConfig.url, state.supabaseConfig.anonKey);
+        supabaseClient.channel('public:contacts')
+          .on('postgres_changes', { event: '*', schema: 'public', table: 'contacts' }, payload => {
+            if (payload.new && payload.new.phone) {
+              const matched = state.leads.find(l => cleanPhone(l.phone) === payload.new.phone);
+              if (matched) {
+                matched.isSent = !!payload.new.is_sent;
+                updateStats();
+                renderTable();
+              }
+            }
+          }).subscribe();
+      } catch (err) {}
+    }
+
+    // --- TEMPLATE MANAGER ---
+    let editingTemplateKey = null;
+
+    function openTemplatesModal() {
+      renderTemplateEditorPicker();
+      renderAvailableTags();
+      const keys = Object.keys(state.templates);
+      if (keys.length > 0) loadTemplateIntoEditor(keys[0]);
+      else createNewTemplateForm();
+      document.getElementById('templatesModal').classList.add('open');
+    }
+    function closeTemplatesModal() { document.getElementById('templatesModal').classList.remove('open'); }
+
+    function renderTemplateEditorPicker() {
+      const picker = document.getElementById('editTplPicker');
+      picker.innerHTML = Object.entries(state.templates).map(([k, tpl]) => \`
+        <option value="\${k}">\${tpl.title} (\${k})\${tpl.mediaUrl ? ' 🖼️' : ''}</option>
+      \`).join('');
+    }
+
+    function renderAvailableTags() {
+      const container = document.getElementById('availableTags');
+      const headers = state.sheetStatus.headers || ['name', 'phone', 'tab', 'orderId', 'status', 'time'];
+      container.innerHTML = '<span style="font-size: 11px; color:#555;">Click tag to insert:</span> ' + headers.map(h => \`
+        <span class="tag-pill" onclick="insertTagIntoText('{{\${h}}}')">{{\${h}}}</span>
+      \`).join(' ');
+    }
+
+    function insertTagIntoText(tag) {
+      const textarea = document.getElementById('tplTextInput');
+      const start = textarea.selectionStart;
+      const end = textarea.selectionEnd;
+      textarea.value = textarea.value.substring(0, start) + tag + textarea.value.substring(end);
+      textarea.selectionStart = textarea.selectionEnd = start + tag.length;
+      textarea.focus();
+    }
+
+    function loadTemplateIntoEditor(key) {
+      editingTemplateKey = key;
+      document.getElementById('editTplPicker').value = key;
+      const tpl = state.templates[key] || { title: '', text: '', mediaUrl: '', mediaType: '' };
+      document.getElementById('tplKeyInput').value = key;
+      document.getElementById('tplKeyInput').disabled = true;
+      document.getElementById('tplTitleInput').value = tpl.title || '';
+      document.getElementById('tplTextInput').value = tpl.text || '';
+      document.getElementById('tplMediaUrlInput').value = tpl.mediaUrl || '';
+      document.getElementById('deleteTplBtn').style.display = 'inline-flex';
+      updateMediaPreviewInEditor();
+    }
+
+    function createNewTemplateForm() {
+      editingTemplateKey = null;
+      document.getElementById('tplKeyInput').value = '';
+      document.getElementById('tplKeyInput').disabled = false;
+      document.getElementById('tplTitleInput').value = '';
+      document.getElementById('tplTextInput').value = '';
+      document.getElementById('tplMediaUrlInput').value = '';
+      document.getElementById('deleteTplBtn').style.display = 'none';
+      updateMediaPreviewInEditor();
+    }
+
+    function updateMediaPreviewInEditor() {
+      const url = document.getElementById('tplMediaUrlInput').value.trim();
+      const previewBox = document.getElementById('mediaEditorPreviewBox');
+      const content = document.getElementById('mediaEditorPreviewContent');
+      if (!url) { previewBox.style.display = 'none'; content.innerHTML = ''; return; }
+      previewBox.style.display = 'block';
+      const isVideo = url.match(/\\.(mp4|mov|webm)$/i);
+      if (isVideo) content.innerHTML = \`<video src="\${url}" controls style="max-width: 100%; max-height: 140px; border-radius: 6px;"></video>\`;
+      else content.innerHTML = \`<img src="\${url}" style="max-width: 100%; max-height: 140px; border-radius: 6px; object-fit: contain;" alt="Preview" />\`;
+    }
+
+    async function uploadSelectedMedia() {
+      const fileInput = document.getElementById('mediaFileInput');
+      if (!fileInput.files || fileInput.files.length === 0) return alert('Choose file first.');
+      const formData = new FormData();
+      formData.append('mediaFile', fileInput.files[0]);
+      try {
+        showToast('Uploading...');
+        const res = await fetch('/api/upload-media', { method: 'POST', body: formData });
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error);
+        document.getElementById('tplMediaUrlInput').value = data.url;
+        updateMediaPreviewInEditor();
+        showToast('Uploaded!');
+      } catch (err) { alert('Upload failed: ' + err.message); }
+    }
+
+    async function saveCurrentTemplate() {
+      const key = (document.getElementById('tplKeyInput').value || '').trim();
+      const title = (document.getElementById('tplTitleInput').value || '').trim();
+      const text = (document.getElementById('tplTextInput').value || '').trim();
+      const mediaUrl = (document.getElementById('tplMediaUrlInput').value || '').trim();
+      if (!key || !text) return alert('Key and text required.');
+      try {
+        const res = await fetch('/api/templates/save-single', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ key, title, text, mediaUrl })
+        });
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error);
+        state.templates = data.templates;
+        renderGlobalTemplateDropdown();
+        renderTemplateEditorPicker();
+        renderTable();
+        closeTemplatesModal();
+        showToast('Template saved for this session!');
+      } catch (e) { alert('Error: ' + e.message); }
+    }
+
+    async function deleteCurrentTemplate() {
+      if (!editingTemplateKey) return;
+      if (!confirm('Delete template "' + editingTemplateKey + '"?')) return;
+      try {
+        const res = await fetch('/api/templates/' + encodeURIComponent(editingTemplateKey), { method: 'DELETE' });
+        const data = await res.json();
+        state.templates = data.templates;
+        renderGlobalTemplateDropdown();
+        renderTable();
+        closeTemplatesModal();
+        showToast('Deleted.');
+      } catch (e) { alert('Failed: ' + e.message); }
+    }
+
     // Initial load
     async function init() {
       try {
@@ -2117,7 +2042,6 @@ app.get('/', (req, res) => {
         const data = await res.json();
         state.sheetStatus = data.sheetStatus;
         state.leads = data.leads;
-        state.groups = data.groups || [];
         state.templates = data.templates;
         state.globalTemplate = data.defaultTemplate || Object.keys(data.templates)[0] || 'welcome';
         state.defaultCountryCode = data.defaultCountryCode || '91';
@@ -2130,7 +2054,7 @@ app.get('/', (req, res) => {
 
         updateBadge();
         updateDbButton();
-        renderGroupDropdown();
+        renderTabsBar();
         renderGlobalTemplateDropdown();
         updateStats();
         applyTemplateToAll(false);
