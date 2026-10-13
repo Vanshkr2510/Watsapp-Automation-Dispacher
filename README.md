@@ -7,6 +7,9 @@ A fast, lightweight, and modern WhatsApp automation dashboard that connects dire
 ## 🚀 Features
 
 - **📊 Direct Google Sheets Integration**: Connect any Google Sheet in seconds by simply pasting its link. No complex Google Cloud credentials or OAuth required!
+- **👥 Contact Groups (Audience Segments)**: Auto-detects a `Group` / `Tag` column from Google Sheets (e.g., `VIP`, `New Leads`, `Wholesale`). Filter contacts by group and inspect/copy all numbers in any group in one click!
+- **🖼️ Media Templates (Photos & Videos)**: Attach photos or videos to any template via direct file upload or URL. Clicking **Send** automatically copies the image to your clipboard ready for instant `Cmd+V` paste into WhatsApp Web!
+- **⚡ 1-Click Global Template Selection**: Set a default template from the top control bar to apply across all contacts in a group instantly.
 - **🔄 Live Sync / Refresh**: Modify rows, add leads, or update statuses in Google Sheets and click **Refresh** to reload without restarting the server.
 - **🏷️ Dynamic Variable Replacement**: Automatically injects values like `{{name}}`, `{{orderId}}`, `{{status}}`, `{{time}}`, or **any custom column** from your Google Sheet directly into your WhatsApp message.
 - **⚡ Official `wa.me` Deep-Links**: Generates standard WhatsApp URLs (`https://wa.me/...`) that open directly in WhatsApp Web or the WhatsApp Desktop/Mobile app with your message pre-filled.
@@ -84,3 +87,4 @@ http://localhost:1212
 - Messages are opened using official `wa.me` links directly in your browser.
 - No third-party WhatsApp bot APIs or unofficial scrapers that risk WhatsApp account bans.
 - Your Google Sheet remains hosted securely on your Google account.
+

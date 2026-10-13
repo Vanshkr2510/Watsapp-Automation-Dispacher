@@ -1,6 +1,7 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
+const multer = require('multer');
 require('dotenv').config();
 
 const { fetchGoogleSheetData } = require('./googleSheets');
@@ -9,25 +10,92 @@ const app = express();
 const PORT = process.env.PORT || 1212;
 const CONFIG_FILE = path.join(__dirname, 'config.json');
 const SAMPLE_CSV = path.join(__dirname, 'sample_leads.csv');
+const UPLOADS_DIR = path.join(__dirname, 'uploads');
+
+if (!fs.existsSync(UPLOADS_DIR)) {
+  fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+}
+
+// Multer storage for media uploads (photos/videos)
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, UPLOADS_DIR),
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase();
+    const cleanBase = path.basename(file.originalname, ext).replace(/[^a-zA-Z0-9_-]/g, '_');
+    cb(null, `${cleanBase}-${Date.now()}${ext}`);
+  }
+});
+const upload = multer({
+  storage,
+  limits: { fileSize: 50 * 1024 * 1024 } // 50MB
+});
 
 app.use(express.json());
+app.use('/uploads', express.static(UPLOADS_DIR));
+
+// Helper: Normalize templates
+function normalizeTemplates(rawTemplates) {
+  const result = {};
+  for (const [key, val] of Object.entries(rawTemplates || {})) {
+    if (typeof val === 'string') {
+      result[key] = {
+        title: key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
+        text: val,
+        mediaUrl: '',
+        mediaType: ''
+      };
+    } else {
+      let mediaType = val.mediaType || '';
+      if (!mediaType && val.mediaUrl) {
+        mediaType = val.mediaUrl.match(/\.(mp4|mov|webm|avi|m4v)$/i) ? 'video' : 'image';
+      }
+      result[key] = {
+        title: val.title || key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
+        text: val.text || '',
+        mediaUrl: val.mediaUrl || '',
+        mediaType
+      };
+    }
+  }
+  return result;
+}
 
 // Load or initialize config
 function loadConfig() {
   const defaults = {
     sheetUrl: process.env.GOOGLE_SHEET_URL || '',
     defaultCountryCode: process.env.DEFAULT_COUNTRY_CODE || '91',
+    defaultTemplate: 'welcome',
     templates: {
-      welcome: 'Hi {{name}}! Welcome to our service. How can we help you today?',
-      order_update: 'Hello {{name}}, your order #{{orderId}} is currently {{status}}.',
-      reminder: 'Hi {{name}}, friendly reminder about our scheduled call/appointment at {{time}}.'
+      welcome: {
+        title: 'Welcome Offer',
+        text: 'Hi {{name}}! Welcome to our store. We are thrilled to have you with us! Let us know how we can help you today.',
+        mediaUrl: '',
+        mediaType: ''
+      },
+      order_update: {
+        title: 'Order Update',
+        text: 'Hello {{name}}, your order #{{orderId}} is currently {{status}}.',
+        mediaUrl: '',
+        mediaType: ''
+      },
+      reminder: {
+        title: 'Appointment Reminder',
+        text: 'Hi {{name}}, friendly reminder about our scheduled call/appointment at {{time}}.',
+        mediaUrl: '',
+        mediaType: ''
+      }
     }
   };
 
   if (fs.existsSync(CONFIG_FILE)) {
     try {
       const data = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
-      return { ...defaults, ...data };
+      return {
+        ...defaults,
+        ...data,
+        templates: normalizeTemplates(data.templates || defaults.templates)
+      };
     } catch (e) {
       console.error('Error reading config.json, using defaults:', e.message);
     }
@@ -93,6 +161,20 @@ function createWaLink(phone, text) {
   return `https://wa.me/${normalizedPhone}?text=${encodedText}`;
 }
 
+// Compute group summary
+function getGroupsSummary(leads) {
+  const groupCounts = {};
+  leads.forEach(l => {
+    const g = l.group || 'General';
+    groupCounts[g] = (groupCounts[g] || 0) + 1;
+  });
+  const list = [{ name: 'All', count: leads.length }];
+  for (const [name, count] of Object.entries(groupCounts)) {
+    list.push({ name, count });
+  }
+  return list;
+}
+
 // Load initial data
 async function initializeData() {
   if (appConfig.sheetUrl) {
@@ -116,8 +198,7 @@ async function initializeData() {
     }
   }
 
-  // Fallback to sample data
-  console.log('Using sample leads. Paste a Google Sheet URL in the dashboard to connect live data.');
+  // Fallback to sample CSV
   try {
     const sampleContent = fs.readFileSync(SAMPLE_CSV, 'utf8');
     const { parse } = require('csv-parse/sync');
@@ -127,8 +208,8 @@ async function initializeData() {
     sheetStatus.headers = Object.keys(records[0] || {});
   } catch (err) {
     currentLeads = [
-      { id: 1, name: 'Rohit Sharma', phone: '+91 98765 43210', orderId: 'ORD-101', status: 'Out for delivery', time: '3:00 PM', variables: { name: 'Rohit Sharma', phone: '+91 98765 43210', orderId: 'ORD-101', status: 'Out for delivery', time: '3:00 PM' } },
-      { id: 2, name: 'Priya Singh', phone: '+91 91234 56789', orderId: 'ORD-102', status: 'Processing', time: '5:30 PM', variables: { name: 'Priya Singh', phone: '+91 91234 56789', orderId: 'ORD-102', status: 'Processing', time: '5:30 PM' } }
+      { id: 1, name: 'Rohit Sharma', phone: '+91 98765 43210', group: 'VIP', orderId: 'ORD-101', status: 'Out for delivery', time: '3:00 PM', variables: { name: 'Rohit Sharma', phone: '+91 98765 43210', group: 'VIP', orderId: 'ORD-101', status: 'Out for delivery', time: '3:00 PM' } },
+      { id: 2, name: 'Priya Singh', phone: '+91 91234 56789', group: 'New Leads', orderId: 'ORD-102', status: 'Processing', time: '5:30 PM', variables: { name: 'Priya Singh', phone: '+91 91234 56789', group: 'New Leads', orderId: 'ORD-102', status: 'Processing', time: '5:30 PM' } }
     ];
   }
 }
@@ -145,7 +226,7 @@ app.post('/api/sheet/connect', async (req, res) => {
   try {
     const data = await fetchGoogleSheetData(sheetUrl);
     currentLeads = data.leads;
-    sentLeadIds.clear(); // reset sent state on new sheet
+    sentLeadIds.clear();
 
     appConfig.sheetUrl = sheetUrl.trim();
     if (countryCode) appConfig.defaultCountryCode = countryCode.trim();
@@ -161,9 +242,10 @@ app.post('/api/sheet/connect', async (req, res) => {
 
     res.json({
       success: true,
-      message: `Successfully connected Google Sheet! Loaded ${data.totalCount} leads.`,
+      message: `Successfully connected Google Sheet! Loaded ${data.totalCount} leads across ${getGroupsSummary(currentLeads).length - 1} groups.`,
       sheetStatus,
       leads: currentLeads,
+      groups: getGroupsSummary(currentLeads),
       headers: data.headers
     });
   } catch (err) {
@@ -197,6 +279,7 @@ app.post('/api/sheet/sync', async (req, res) => {
       message: `Synced ${data.totalCount} leads successfully!`,
       sheetStatus,
       leads: currentLeads,
+      groups: getGroupsSummary(currentLeads),
       headers: data.headers
     });
   } catch (err) {
@@ -208,17 +291,101 @@ app.post('/api/sheet/sync', async (req, res) => {
   }
 });
 
-// Get current state (leads, templates, status)
+// Get state (leads, templates, groups, status)
 app.get('/api/state', (req, res) => {
   res.json({
     sheetStatus,
     leads: currentLeads.map(l => ({ ...l, isSent: sentLeadIds.has(l.id) })),
+    groups: getGroupsSummary(currentLeads),
     templates: appConfig.templates,
+    defaultTemplate: appConfig.defaultTemplate || Object.keys(appConfig.templates)[0] || 'welcome',
     defaultCountryCode: appConfig.defaultCountryCode
   });
 });
 
-// Mark a lead as sent
+// Get contacts in a specific group
+app.get('/api/group-contacts/:groupName', (req, res) => {
+  const { groupName } = req.params;
+  const decodedGroup = decodeURIComponent(groupName);
+
+  const matched = decodedGroup === 'All'
+    ? currentLeads
+    : currentLeads.filter(l => (l.group || 'General').toLowerCase() === decodedGroup.toLowerCase());
+
+  res.json({
+    group: decodedGroup,
+    count: matched.length,
+    contacts: matched.map(l => ({
+      id: l.id,
+      name: l.name,
+      phone: l.phone,
+      cleanPhone: cleanPhoneNumber(l.phone),
+      group: l.group || 'General',
+      status: l.status,
+      isSent: sentLeadIds.has(l.id)
+    }))
+  });
+});
+
+// Media upload endpoint
+app.post('/api/upload-media', upload.single('mediaFile'), (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'No media file was uploaded' });
+  }
+
+  const fileUrl = `/uploads/${req.file.filename}`;
+  const isVideo = req.file.mimetype.startsWith('video/') || req.file.filename.match(/\.(mp4|mov|webm|avi)$/i);
+  const mediaType = isVideo ? 'video' : 'image';
+
+  res.json({
+    success: true,
+    url: fileUrl,
+    mediaType,
+    fileName: req.file.originalname,
+    size: req.file.size
+  });
+});
+
+// Save single template (add or update)
+app.post('/api/templates/save-single', (req, res) => {
+  const { key, title, text, mediaUrl, mediaType } = req.body;
+  if (!key || !text) {
+    return res.status(400).json({ error: 'Template key and message text are required' });
+  }
+
+  const cleanKey = key.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '_');
+  appConfig.templates[cleanKey] = {
+    title: title || cleanKey.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
+    text: text.trim(),
+    mediaUrl: mediaUrl ? mediaUrl.trim() : '',
+    mediaType: mediaType || (mediaUrl && mediaUrl.match(/\.(mp4|mov|webm)$/i) ? 'video' : (mediaUrl ? 'image' : ''))
+  };
+
+  saveConfig(appConfig);
+  res.json({ success: true, key: cleanKey, template: appConfig.templates[cleanKey], templates: appConfig.templates });
+});
+
+// Delete template
+app.delete('/api/templates/:key', (req, res) => {
+  const { key } = req.params;
+  if (appConfig.templates[key]) {
+    delete appConfig.templates[key];
+    saveConfig(appConfig);
+  }
+  res.json({ success: true, templates: appConfig.templates });
+});
+
+// Save default template
+app.post('/api/set-default-template', (req, res) => {
+  const { defaultTemplate } = req.body;
+  if (defaultTemplate && appConfig.templates[defaultTemplate]) {
+    appConfig.defaultTemplate = defaultTemplate;
+    saveConfig(appConfig);
+  }
+  res.json({ success: true, defaultTemplate: appConfig.defaultTemplate });
+});
+
+// Mark lead as sent
 app.post('/api/leads/mark-sent', (req, res) => {
   const { id } = req.body;
   if (id != null) {
@@ -233,40 +400,12 @@ app.post('/api/leads/reset-sent', (req, res) => {
   res.json({ success: true });
 });
 
-// Save / update templates
-app.post('/api/templates', (req, res) => {
-  const { templates } = req.body;
-  if (!templates || typeof templates !== 'object') {
-    return res.status(400).json({ error: 'Invalid templates object' });
-  }
-  appConfig.templates = templates;
-  saveConfig(appConfig);
-  res.json({ success: true, templates: appConfig.templates });
-});
-
 // Download sample CSV
 app.get('/api/download-sample', (req, res) => {
   res.download(SAMPLE_CSV, 'sample_leads.csv');
 });
 
-// Generate link on demand
-app.post('/api/generate-link', (req, res) => {
-  const { phone, templateKey, customText, variables } = req.body;
-
-  let message = customText;
-  if (!message && templateKey && appConfig.templates[templateKey]) {
-    message = renderTemplate(appConfig.templates[templateKey], variables || {});
-  }
-
-  if (!phone || !message) {
-    return res.status(400).json({ error: 'Missing phone number or message' });
-  }
-
-  const link = createWaLink(phone, message);
-  res.json({ link, message });
-});
-
-// Dispatcher Dashboard
+// Dashboard UI
 app.get('/', (req, res) => {
   res.send(`
 <!DOCTYPE html>
@@ -289,14 +428,14 @@ app.get('/', (req, res) => {
     }
 
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
-    body { background-color: var(--bg); color: var(--text); padding: 24px 16px; min-height: 100vh; }
-    .container { max-width: 1100px; margin: 0 auto; }
+    body { background-color: var(--bg); color: var(--text); padding: 20px 16px; min-height: 100vh; }
+    .container { max-width: 1140px; margin: 0 auto; }
 
     header {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      margin-bottom: 20px;
+      margin-bottom: 18px;
       flex-wrap: wrap;
       gap: 12px;
     }
@@ -307,54 +446,39 @@ app.get('/', (req, res) => {
       display: flex; align-items: center; justify-content: center; color: white;
       font-size: 24px; box-shadow: 0 4px 12px rgba(37,211,102,0.3);
     }
-    h1 { font-size: 22px; font-weight: 700; color: #111B21; }
+    h1 { font-size: 21px; font-weight: 700; color: #111B21; }
     p.subtitle { font-size: 13px; color: var(--text-muted); margin-top: 2px; }
 
-    /* Card */
     .card {
       background: var(--card-bg);
       border-radius: var(--radius);
-      padding: 20px;
-      box-shadow: 0 1px 3px rgba(11,20,26,0.08);
-      margin-bottom: 20px;
+      padding: 18px 20px;
+      box-shadow: 0 1px 3px rgba(11,20,26,0.06);
+      margin-bottom: 18px;
       border: 1px solid var(--border);
     }
 
-    /* Google Sheet Connect Box */
-    .sheet-bar {
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-    }
-    .sheet-row {
-      display: flex;
-      gap: 10px;
-      flex-wrap: wrap;
-    }
-    .input-group {
-      flex: 1;
-      min-width: 280px;
-      position: relative;
-    }
+    /* Top Google Sheet Connect */
+    .sheet-bar { display: flex; flex-direction: column; gap: 10px; }
+    .sheet-row { display: flex; gap: 10px; flex-wrap: wrap; }
+    .input-group { flex: 1; min-width: 280px; }
     input[type="text"], input[type="search"] {
       width: 100%;
-      padding: 11px 14px;
+      padding: 10px 14px;
       border: 1.5px solid #D1D7DB;
       border-radius: 8px;
       font-size: 14px;
       outline: none;
       transition: border-color 0.2s;
     }
-    input[type="text"]:focus, input[type="search"]:focus {
-      border-color: var(--primary);
-    }
+    input[type="text"]:focus, input[type="search"]:focus { border-color: var(--primary); }
 
     .btn {
       display: inline-flex;
       align-items: center;
       justify-content: center;
       gap: 6px;
-      padding: 10px 18px;
+      padding: 9px 16px;
       border-radius: 8px;
       font-size: 14px;
       font-weight: 600;
@@ -374,64 +498,102 @@ app.get('/', (req, res) => {
       display: inline-flex;
       align-items: center;
       gap: 6px;
-      font-size: 13px;
+      font-size: 12px;
       font-weight: 600;
-      padding: 6px 12px;
+      padding: 5px 12px;
       border-radius: 20px;
-      width: fit-content;
     }
     .status-connected { background: #E7FCE3; color: #0E702A; }
     .status-disconnected { background: #FFF4E5; color: #B25E00; }
     .status-error { background: #FDE8E8; color: #9B1C1C; }
 
-    /* Instructions accordion */
-    .guide-toggle {
-      font-size: 13px;
-      color: #008069;
-      cursor: pointer;
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-      font-weight: 600;
-      margin-top: 4px;
-    }
+    .guide-toggle { font-size: 12px; color: #008069; cursor: pointer; font-weight: 600; }
     .guide-box {
       display: none;
       background: #F8FAFC;
       border: 1px dashed #CBD5E1;
-      padding: 14px;
+      padding: 12px;
       border-radius: 8px;
       font-size: 13px;
       line-height: 1.6;
       margin-top: 8px;
     }
-    .guide-box ol { margin-left: 20px; }
     .guide-box code { background: #E2E8F0; padding: 2px 5px; border-radius: 4px; font-size: 12px; }
+
+    /* Control Box: 3-Step Campaign Bar */
+    .campaign-control-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr auto;
+      gap: 16px;
+      align-items: flex-end;
+    }
+    @media (max-width: 820px) {
+      .campaign-control-grid { grid-template-columns: 1fr; }
+    }
+    .step-box {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .step-label {
+      font-size: 12px;
+      font-weight: 700;
+      color: #008069;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    select {
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1.5px solid #D1D7DB;
+      font-size: 14px;
+      background: white;
+      outline: none;
+      font-weight: 500;
+    }
+    select:focus { border-color: var(--primary); }
+
+    /* Media badge */
+    .media-indicator {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 11px;
+      background: #E0F2FE;
+      color: #0369A1;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-weight: 600;
+    }
 
     /* Stats bar */
     .stats-grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
       gap: 12px;
-      margin-bottom: 20px;
+      margin-bottom: 18px;
     }
     .stat-card {
       background: white;
-      padding: 14px 18px;
+      padding: 12px 18px;
       border-radius: var(--radius);
       border: 1px solid var(--border);
-      box-shadow: 0 1px 3px rgba(11,20,26,0.05);
+      box-shadow: 0 1px 3px rgba(11,20,26,0.04);
     }
-    .stat-val { font-size: 24px; font-weight: 700; color: #111B21; }
-    .stat-lbl { font-size: 12px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
+    .stat-val { font-size: 22px; font-weight: 700; color: #111B21; }
+    .stat-lbl { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
 
-    /* Filters */
+    /* Filter Bar */
     .filter-bar {
       display: flex;
       justify-content: space-between;
       gap: 12px;
       flex-wrap: wrap;
-      margin-bottom: 16px;
+      margin-bottom: 14px;
       align-items: center;
     }
     .filter-tabs { display: flex; gap: 6px; }
@@ -457,21 +619,32 @@ app.get('/', (req, res) => {
     table { width: 100%; border-collapse: collapse; text-align: left; font-size: 14px; }
     th {
       background: #F9FAFB;
-      padding: 12px 14px;
+      padding: 11px 14px;
       font-weight: 600;
       color: #54656F;
       border-bottom: 1.5px solid var(--border);
       font-size: 13px;
     }
     td {
-      padding: 12px 14px;
+      padding: 11px 14px;
       border-bottom: 1px solid var(--border);
       vertical-align: middle;
     }
     tr:hover td { background: #FAFAFA; }
 
     .lead-name { font-weight: 600; color: #111B21; }
-    .lead-phone { font-family: monospace; color: #008069; font-weight: 500; font-size: 13px; }
+    .lead-phone { font-family: monospace; color: #008069; font-weight: 600; font-size: 13px; }
+    .group-pill {
+      display: inline-block;
+      font-size: 11px;
+      background: #F0FDF4;
+      color: #166534;
+      border: 1px solid #BBF7D0;
+      padding: 2px 7px;
+      border-radius: 12px;
+      font-weight: 600;
+      margin-top: 3px;
+    }
     .meta-tag {
       display: inline-block;
       font-size: 11px;
@@ -482,17 +655,6 @@ app.get('/', (req, res) => {
       margin-right: 4px;
       margin-top: 3px;
     }
-
-    select {
-      width: 100%;
-      padding: 8px 10px;
-      border-radius: 6px;
-      border: 1px solid #D1D7DB;
-      font-size: 13px;
-      background: white;
-      outline: none;
-    }
-    select:focus { border-color: var(--primary); }
 
     .msg-preview {
       font-size: 12px;
@@ -505,6 +667,20 @@ app.get('/', (req, res) => {
       max-width: 380px;
       white-space: pre-wrap;
       word-break: break-word;
+    }
+    .media-thumb-preview {
+      margin-top: 6px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .media-thumb {
+      width: 50px;
+      height: 50px;
+      object-fit: cover;
+      border-radius: 6px;
+      border: 1px solid #CBD5E1;
+      cursor: pointer;
     }
 
     .badge-sent {
@@ -530,11 +706,11 @@ app.get('/', (req, res) => {
       font-weight: 600;
     }
 
-    .action-group { display: flex; gap: 6px; align-items: center; }
+    .action-group { display: flex; flex-direction: column; gap: 4px; align-items: center; }
     .btn-wa {
       background: #25D366;
       color: white;
-      padding: 7px 14px;
+      padding: 7px 12px;
       border-radius: 6px;
       font-weight: 600;
       font-size: 13px;
@@ -543,11 +719,13 @@ app.get('/', (req, res) => {
       align-items: center;
       gap: 5px;
       transition: background 0.15s;
+      width: 100%;
+      justify-content: center;
     }
     .btn-wa:hover { background: #1EBE5D; }
     .btn-wa.sent { background: #E9EDEF; color: #54656F; }
 
-    /* Modal / Template editor */
+    /* Modals */
     .modal-backdrop {
       display: none;
       position: fixed;
@@ -562,14 +740,18 @@ app.get('/', (req, res) => {
     .modal {
       background: white;
       border-radius: 12px;
-      max-width: 650px;
+      max-width: 680px;
       width: 100%;
-      padding: 24px;
+      padding: 22px;
       box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+      max-height: 90vh;
+      display: flex;
+      flex-direction: column;
     }
-    .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+    .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
     .modal-title { font-size: 18px; font-weight: 700; }
     .close-btn { cursor: pointer; font-size: 20px; border: none; background: none; color: #667781; }
+    .modal-body { overflow-y: auto; flex: 1; padding-right: 4px; }
 
     textarea {
       width: 100%;
@@ -596,6 +778,7 @@ app.get('/', (req, res) => {
     }
     .tag-pill:hover { background: #D1D7DB; }
 
+    /* Toast */
     .toast {
       position: fixed;
       bottom: 24px;
@@ -620,28 +803,26 @@ app.get('/', (req, res) => {
         <div class="logo">💬</div>
         <div>
           <h1>WhatsApp Automation Dispatcher</h1>
-          <p class="subtitle">Direct Google Sheets integration &bull; Click to chat via official WhatsApp Web / App</p>
+          <p class="subtitle">Google Sheets &bull; Contact Groups &bull; Media Templates &bull; WhatsApp Web</p>
         </div>
       </div>
-      <div style="display: flex; gap: 8px;">
-        <button class="btn btn-secondary btn-sm" onclick="openTemplatesModal()">⚙️ Edit Templates</button>
+      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+        <button class="btn btn-secondary btn-sm" onclick="openTemplatesModal()">🎨 Template & Media Manager</button>
         <a href="/api/download-sample" class="btn btn-secondary btn-sm">📥 Sample CSV</a>
       </div>
     </header>
 
-    <!-- Google Sheet Connection Box -->
+    <!-- Google Sheet Connect Bar -->
     <div class="card">
       <div class="sheet-bar">
         <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
-          <div style="font-weight: 600; font-size: 15px;">📊 Connect Google Sheet</div>
-          <div id="statusBadge" class="status-badge status-disconnected">
-            <span>●</span> Checking connection...
-          </div>
+          <div style="font-weight: 600; font-size: 14px;">📊 Google Sheet Connection</div>
+          <div id="statusBadge" class="status-badge status-disconnected">● Checking...</div>
         </div>
 
         <div class="sheet-row">
           <div class="input-group">
-            <input type="text" id="sheetUrlInput" placeholder="Paste your Google Sheet link here (e.g. https://docs.google.com/spreadsheets/d/...)" />
+            <input type="text" id="sheetUrlInput" placeholder="Paste your Google Sheet link here..." />
           </div>
           <button class="btn btn-primary" id="connectBtn" onclick="connectSheet()">
             <span>🔗 Connect & Sync</span>
@@ -652,19 +833,49 @@ app.get('/', (req, res) => {
         </div>
 
         <div>
-          <span class="guide-toggle" onclick="toggleGuide()">ℹ️ How to set up your Google Sheet in 30 seconds &darr;</span>
+          <span class="guide-toggle" onclick="toggleGuide()">ℹ️ How to format and share your Google Sheet &darr;</span>
           <div id="guideBox" class="guide-box">
             <ol>
-              <li>Create a new sheet in <a href="https://sheets.new" target="_blank" style="color: #008069; font-weight: 600;">Google Sheets</a>.</li>
-              <li>Make row 1 your headers: <code>Name</code>, <code>Phone</code>, <code>OrderId</code>, <code>Status</code>, <code>Time</code> (or any custom columns!).</li>
-              <li>Add your customer data in the rows below. (Numbers can be entered with or without country code, e.g. <code>+91 98765 43210</code> or <code>9876543210</code>).</li>
-              <li>Click the green <strong>Share</strong> button (top right of Google Sheets) &rarr; change General access to <strong>"Anyone with the link can view"</strong>.</li>
-              <li>Copy the link from your browser address bar and paste it above!</li>
+              <li>Create a spreadsheet on <a href="https://sheets.new" target="_blank" style="color: #008069; font-weight: 600;">Google Sheets</a>.</li>
+              <li>Include headers: <code>Name</code>, <code>Phone</code>, <code>Group</code> (e.g. VIP, New Leads), <code>OrderId</code>, <code>Status</code>, <code>Time</code>.</li>
+              <li>Click <strong>Share</strong> (top right) &rarr; change General access to <strong>"Anyone with the link can view"</strong>.</li>
+              <li>Paste the URL above and click <strong>Connect & Sync</strong>!</li>
             </ol>
-            <div style="margin-top: 8px;">
-              💡 <em>Tip: You can also use any extra column names inside templates as <code>{{columnName}}</code> tags!</em>
-            </div>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 3-STEP CAMPAIGN CONTROLLER CARD -->
+    <div class="card" style="border-left: 4px solid var(--primary);">
+      <div class="campaign-control-grid">
+        <!-- Step 1: Select Contact Group -->
+        <div class="step-box">
+          <div class="step-label">
+            <span>1️⃣ Select Contact Group</span>
+            <button class="btn btn-secondary btn-sm" style="padding: 2px 8px; font-size: 11px;" onclick="openGroupModal()">
+              👥 View Group Numbers
+            </button>
+          </div>
+          <select id="groupSelect" onchange="onGroupChanged(this.value)">
+            <option value="All">All Contacts (0)</option>
+          </select>
+        </div>
+
+        <!-- Step 2: Select Global Template -->
+        <div class="step-box">
+          <div class="step-label">
+            <span>2️⃣ Select Template (Applied at once)</span>
+            <span id="templateMediaBadge" style="display: none;" class="media-indicator">🖼️ Has Media</span>
+          </div>
+          <select id="globalTemplateSelect" onchange="onGlobalTemplateChanged(this.value)"></select>
+        </div>
+
+        <!-- Quick Reset / Stats Action -->
+        <div style="display: flex; gap: 8px;">
+          <button class="btn btn-primary" onclick="applyTemplateToAll()" title="Apply current template to all visible rows">
+            ⚡ Apply to All
+          </button>
         </div>
       </div>
     </div>
@@ -673,7 +884,7 @@ app.get('/', (req, res) => {
     <div class="stats-grid">
       <div class="stat-card">
         <div class="stat-val" id="totalLeadsCount">0</div>
-        <div class="stat-lbl">Total Contacts</div>
+        <div class="stat-lbl">Group Contacts</div>
       </div>
       <div class="stat-card">
         <div class="stat-val" id="sentCount" style="color: #0E702A;">0</div>
@@ -693,8 +904,8 @@ app.get('/', (req, res) => {
         <button class="tab-btn" onclick="setFilter('sent', this)">Sent</button>
       </div>
 
-      <div style="display: flex; gap: 8px; flex: 1; max-width: 400px;">
-        <input type="search" id="searchInput" oninput="renderTable()" placeholder="Search by name, phone, order ID..." />
+      <div style="display: flex; gap: 8px; flex: 1; max-width: 420px;">
+        <input type="search" id="searchInput" oninput="renderTable()" placeholder="Search name, phone, order ID..." />
         <button class="btn btn-secondary btn-sm" onclick="resetSentStatus()" title="Reset all Sent statuses">Reset Sent</button>
       </div>
     </div>
@@ -705,10 +916,10 @@ app.get('/', (req, res) => {
         <thead>
           <tr>
             <th style="width: 50px;">Status</th>
-            <th>Contact</th>
-            <th>Details</th>
-            <th>Template & Preview</th>
-            <th style="width: 140px; text-align: center;">Action</th>
+            <th>Contact & Group</th>
+            <th>Order Details</th>
+            <th>Template & Message Preview</th>
+            <th style="width: 150px; text-align: center;">Action</th>
           </tr>
         </thead>
         <tbody id="tableBody">
@@ -718,23 +929,106 @@ app.get('/', (req, res) => {
     </div>
   </div>
 
-  <!-- Template Manager Modal -->
+  <!-- MODAL: Group Contacts Inspector -->
+  <div id="groupModal" class="modal-backdrop">
+    <div class="modal">
+      <div class="modal-header">
+        <div class="modal-title" id="groupModalTitle">👥 Group Numbers</div>
+        <button class="close-btn" onclick="closeGroupModal()">&times;</button>
+      </div>
+      <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 12px;">
+        All contact numbers in this group. You can copy them for broadcasting or records.
+      </p>
+
+      <div style="display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap;">
+        <button class="btn btn-secondary btn-sm" onclick="copyGroupNumbers(',')">📋 Copy All (Comma-Separated)</button>
+        <button class="btn btn-secondary btn-sm" onclick="copyGroupNumbers('\\n')">📋 Copy All (One Per Line)</button>
+      </div>
+
+      <div class="modal-body" style="max-height: 50vh;">
+        <table style="width: 100%; font-size: 13px;">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Phone</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="groupModalBody"></tbody>
+        </table>
+      </div>
+
+      <div style="display: flex; justify-content: flex-end; margin-top: 14px;">
+        <button class="btn btn-primary btn-sm" onclick="closeGroupModal()">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: Template & Media Manager -->
   <div id="templatesModal" class="modal-backdrop">
     <div class="modal">
       <div class="modal-header">
-        <div class="modal-title">⚙️ Message Templates</div>
+        <div class="modal-title">🎨 Template & Media Manager</div>
         <button class="close-btn" onclick="closeTemplatesModal()">&times;</button>
       </div>
-      <p style="font-size: 13px; color: #666; margin-bottom: 14px;">
-        Variables in double curly brackets will be automatically filled with data from Google Sheets:
-      </p>
-      <div id="availableTags" style="margin-bottom: 16px;"></div>
 
-      <div id="templateInputs" style="display: flex; flex-direction: column; gap: 14px; max-height: 50vh; overflow-y: auto; padding-right: 4px;"></div>
+      <div class="modal-body">
+        <p style="font-size: 13px; color: #666; margin-bottom: 10px;">
+          Attach a <strong>Photo</strong> or <strong>Video</strong> (optional) and write personalized text.
+        </p>
 
-      <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px;">
-        <button class="btn btn-secondary" onclick="closeTemplatesModal()">Cancel</button>
-        <button class="btn btn-primary" onclick="saveTemplates()">Save Templates</button>
+        <!-- Template selector / Create new -->
+        <div style="display: flex; gap: 10px; margin-bottom: 16px; align-items: center;">
+          <select id="editTplPicker" onchange="loadTemplateIntoEditor(this.value)" style="flex: 1;"></select>
+          <button class="btn btn-secondary btn-sm" onclick="createNewTemplateForm()">+ New Template</button>
+        </div>
+
+        <div style="background: #F8FAFC; border: 1px solid #E2E8F0; padding: 14px; border-radius: 8px; margin-bottom: 14px;">
+          <div style="margin-bottom: 10px;">
+            <label style="font-weight: 600; font-size: 12px; text-transform: uppercase;">Template Key / ID</label>
+            <input type="text" id="tplKeyInput" style="margin-top: 4px;" placeholder="e.g. welcome_offer, reminder" />
+          </div>
+
+          <div style="margin-bottom: 10px;">
+            <label style="font-weight: 600; font-size: 12px; text-transform: uppercase;">Display Title</label>
+            <input type="text" id="tplTitleInput" style="margin-top: 4px;" placeholder="e.g. Festive Special Offer" />
+          </div>
+
+          <div style="margin-bottom: 10px;">
+            <label style="font-weight: 600; font-size: 12px; text-transform: uppercase;">Message Text</label>
+            <div id="availableTags" style="margin: 6px 0;"></div>
+            <textarea id="tplTextInput" placeholder="Write your template text here..."></textarea>
+          </div>
+
+          <!-- Media Attachment Section -->
+          <div style="margin-top: 12px; padding-top: 12px; border-top: 1px dashed #CBD5E1;">
+            <label style="font-weight: 600; font-size: 12px; text-transform: uppercase;">Attach Photo / Video (Optional)</label>
+            
+            <div style="display: flex; gap: 8px; margin-top: 6px; align-items: center; flex-wrap: wrap;">
+              <input type="file" id="mediaFileInput" accept="image/*,video/*" style="font-size: 13px;" />
+              <button class="btn btn-secondary btn-sm" type="button" onclick="uploadSelectedMedia()">⬆️ Upload File</button>
+            </div>
+
+            <div style="margin-top: 8px;">
+              <span style="font-size: 11px; color: #666;">Or paste Media URL:</span>
+              <input type="text" id="tplMediaUrlInput" oninput="updateMediaPreviewInEditor()" placeholder="https://example.com/photo.jpg or /uploads/..." style="margin-top: 3px; font-size: 13px;" />
+            </div>
+
+            <!-- Media Preview in Editor -->
+            <div id="mediaEditorPreviewBox" style="margin-top: 10px; display: none;">
+              <div style="font-size: 11px; font-weight: 600; color: #555; margin-bottom: 4px;">Media Preview:</div>
+              <div id="mediaEditorPreviewContent"></div>
+            </div>
+          </div>
+        </div>
+
+        <div style="display: flex; justify-content: space-between; gap: 10px; align-items: center;">
+          <button class="btn btn-secondary btn-sm" id="deleteTplBtn" style="color: #DC2626;" onclick="deleteCurrentTemplate()">🗑️ Delete Template</button>
+          <div style="display: flex; gap: 8px;">
+            <button class="btn btn-secondary btn-sm" onclick="closeTemplatesModal()">Cancel</button>
+            <button class="btn btn-primary btn-sm" onclick="saveCurrentTemplate()">💾 Save Template</button>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -744,7 +1038,10 @@ app.get('/', (req, res) => {
   <script>
     let state = {
       leads: [],
+      groups: [],
       templates: {},
+      selectedGroup: 'All',
+      globalTemplate: 'welcome',
       sheetStatus: {},
       activeFilter: 'all',
       defaultCountryCode: '91'
@@ -754,7 +1051,7 @@ app.get('/', (req, res) => {
       const toast = document.getElementById('toast');
       toast.innerText = msg;
       toast.style.display = 'block';
-      setTimeout(() => { toast.style.display = 'none'; }, 3500);
+      setTimeout(() => { toast.style.display = 'none'; }, 3800);
     }
 
     function toggleGuide() {
@@ -769,7 +1066,7 @@ app.get('/', (req, res) => {
       return cleaned;
     }
 
-    function renderTemplate(tplText, variables) {
+    function renderTemplateText(tplText, variables) {
       if (!tplText) return '';
       let res = tplText;
       for (const [key, val] of Object.entries(variables || {})) {
@@ -784,7 +1081,7 @@ app.get('/', (req, res) => {
       const st = state.sheetStatus;
       if (st.isConnected) {
         badge.className = 'status-badge status-connected';
-        badge.innerHTML = '🟢 Connected (' + state.leads.length + ' leads loaded)';
+        badge.innerHTML = '🟢 Connected (' + state.leads.length + ' contacts loaded)';
       } else if (st.error) {
         badge.className = 'status-badge status-error';
         badge.innerHTML = '🔴 ' + (st.error.length > 50 ? st.error.slice(0, 48) + '...' : st.error);
@@ -796,13 +1093,53 @@ app.get('/', (req, res) => {
     }
 
     function updateStats() {
-      const total = state.leads.length;
-      const sent = state.leads.filter(l => l.isSent).length;
+      const groupLeads = getFilteredByGroup();
+      const total = groupLeads.length;
+      const sent = groupLeads.filter(l => l.isSent).length;
       const pending = total - sent;
 
       document.getElementById('totalLeadsCount').innerText = total;
       document.getElementById('sentCount').innerText = sent;
       document.getElementById('pendingCount').innerText = pending;
+    }
+
+    function getFilteredByGroup() {
+      if (state.selectedGroup === 'All') return state.leads;
+      return state.leads.filter(l => (l.group || 'General').toLowerCase() === state.selectedGroup.toLowerCase());
+    }
+
+    function onGroupChanged(groupName) {
+      state.selectedGroup = groupName;
+      updateStats();
+      renderTable();
+    }
+
+    function onGlobalTemplateChanged(tplKey) {
+      state.globalTemplate = tplKey;
+      applyTemplateToAll(false);
+      updateTemplateMediaBadge();
+    }
+
+    function applyTemplateToAll(showToastAlert = true) {
+      const groupLeads = getFilteredByGroup();
+      groupLeads.forEach(l => {
+        l.selectedTemplate = state.globalTemplate;
+      });
+      renderTable();
+      if (showToastAlert) {
+        showToast('Applied template "' + (state.templates[state.globalTemplate]?.title || state.globalTemplate) + '" to all ' + groupLeads.length + ' contacts.');
+      }
+    }
+
+    function updateTemplateMediaBadge() {
+      const badge = document.getElementById('templateMediaBadge');
+      const tpl = state.templates[state.globalTemplate];
+      if (tpl && tpl.mediaUrl) {
+        badge.style.display = 'inline-flex';
+        badge.innerText = tpl.mediaType === 'video' ? '🎥 Video Attached' : '🖼️ Photo Attached';
+      } else {
+        badge.style.display = 'none';
+      }
     }
 
     function setFilter(filter, btn) {
@@ -812,11 +1149,36 @@ app.get('/', (req, res) => {
       renderTable();
     }
 
+    function renderGroupDropdown() {
+      const select = document.getElementById('groupSelect');
+      select.innerHTML = state.groups.map(g => \`
+        <option value="\${g.name}" \${g.name === state.selectedGroup ? 'selected' : ''}>
+          \${g.name === 'All' ? '🌐 All Contacts' : '📁 Group: ' + g.name} (\${g.count})
+        </option>
+      \`).join('');
+    }
+
+    function renderGlobalTemplateDropdown() {
+      const select = document.getElementById('globalTemplateSelect');
+      const keys = Object.keys(state.templates);
+      if (keys.length === 0) {
+        select.innerHTML = '<option value="">No templates defined</option>';
+        return;
+      }
+      select.innerHTML = keys.map(k => {
+        const tpl = state.templates[k];
+        const mediaIcon = tpl.mediaUrl ? (tpl.mediaType === 'video' ? ' 🎥' : ' 🖼️') : '';
+        return \`<option value="\${k}" \${k === state.globalTemplate ? 'selected' : ''}>\${tpl.title}\${mediaIcon}</option>\`;
+      }).join('');
+      updateTemplateMediaBadge();
+    }
+
     function renderTable() {
       const tbody = document.getElementById('tableBody');
       const search = (document.getElementById('searchInput').value || '').toLowerCase().trim();
+      const groupLeads = getFilteredByGroup();
 
-      const filtered = state.leads.filter(lead => {
+      const filtered = groupLeads.filter(lead => {
         if (state.activeFilter === 'sent' && !lead.isSent) return false;
         if (state.activeFilter === 'pending' && lead.isSent) return false;
 
@@ -824,26 +1186,28 @@ app.get('/', (req, res) => {
           const matchName = (lead.name || '').toLowerCase().includes(search);
           const matchPhone = (lead.phone || '').toLowerCase().includes(search);
           const matchOrder = (lead.orderId || '').toLowerCase().includes(search);
-          const matchStatus = (lead.status || '').toLowerCase().includes(search);
-          if (!matchName && !matchPhone && !matchOrder && !matchStatus) return false;
+          const matchGroup = (lead.group || '').toLowerCase().includes(search);
+          if (!matchName && !matchPhone && !matchOrder && !matchGroup) return false;
         }
         return true;
       });
 
       if (filtered.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; padding: 32px; color: #888;">No contacts found matching filter.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; padding: 32px; color: #888;">No contacts found for selected group & filter.</td></tr>';
         return;
       }
 
+      const availableTemplates = Object.keys(state.templates);
+
       tbody.innerHTML = filtered.map(lead => {
-        const availableTemplates = Object.keys(state.templates);
-        const selectedTpl = lead.selectedTemplate || (state.templates[lead.template] ? lead.template : availableTemplates[0] || 'welcome');
+        const currentTplKey = lead.selectedTemplate || state.globalTemplate || availableTemplates[0] || 'welcome';
+        const tplObj = state.templates[currentTplKey] || { text: '', mediaUrl: '', mediaType: '' };
 
         let msg = '';
-        if (lead.customMessage && selectedTpl === '__custom__') {
+        if (lead.customMessage && currentTplKey === '__custom__') {
           msg = lead.customMessage;
         } else {
-          msg = renderTemplate(state.templates[selectedTpl] || '', lead.variables);
+          msg = renderTemplateText(tplObj.text || '', lead.variables);
         }
 
         const normalizedPhone = cleanPhone(lead.phone);
@@ -853,12 +1217,37 @@ app.get('/', (req, res) => {
           ? '<span class="badge-sent">✓ Sent</span>'
           : '<span class="badge-pending">⏳ Pending</span>';
 
+        // Media thumbnail
+        let mediaHtml = '';
+        if (tplObj.mediaUrl) {
+          if (tplObj.mediaType === 'video') {
+            mediaHtml = \`
+              <div class="media-thumb-preview">
+                <span class="media-indicator">🎥 Video Attached</span>
+                <a href="\${tplObj.mediaUrl}" target="_blank" style="font-size: 11px; color: #008069;">View Video</a>
+              </div>
+            \`;
+          } else {
+            mediaHtml = \`
+              <div class="media-thumb-preview">
+                <img src="\${tplObj.mediaUrl}" class="media-thumb" onclick="window.open('\${tplObj.mediaUrl}', '_blank')" alt="Attachment" title="Click to open full image" />
+                <div>
+                  <button type="button" class="btn btn-secondary btn-sm" style="font-size: 11px; padding: 2px 7px;" onclick="copyImageToClipboard('\${tplObj.mediaUrl}')">
+                    📋 Copy Image
+                  </button>
+                </div>
+              </div>
+            \`;
+          }
+        }
+
         return \`
           <tr>
             <td>\${statusPill}</td>
             <td>
               <div class="lead-name">\${lead.name || 'Unnamed'}</div>
               <div class="lead-phone">\${lead.phone || '<span style="color:#e53e3e">No Phone</span>'}</div>
+              <span class="group-pill">📁 \${lead.group || 'General'}</span>
             </td>
             <td>
               \${lead.orderId ? '<span class="meta-tag">#' + lead.orderId + '</span>' : ''}
@@ -866,17 +1255,19 @@ app.get('/', (req, res) => {
               \${lead.time ? '<span class="meta-tag">⏰ ' + lead.time + '</span>' : ''}
             </td>
             <td>
-              <select onchange="changeLeadTemplate(\${lead.id}, this.value)">
-                \${lead.customMessage ? '<option value="__custom__" ' + (selectedTpl === '__custom__' ? 'selected' : '') + '>📄 Custom Message (from Sheet)</option>' : ''}
-                \${availableTemplates.map(k => \`<option value="\${k}" \${k === selectedTpl ? 'selected' : ''}>\${k.replace('_', ' ').toUpperCase()}</option>\`).join('')}
+              <select onchange="changeLeadTemplate(\${lead.id}, this.value)" style="margin-bottom: 4px;">
+                \${lead.customMessage ? '<option value="__custom__" ' + (currentTplKey === '__custom__' ? 'selected' : '') + '>📄 Custom Message (from Sheet)</option>' : ''}
+                \${availableTemplates.map(k => \`<option value="\${k}" \${k === currentTplKey ? 'selected' : ''}>\${state.templates[k].title}\${state.templates[k].mediaUrl ? ' (Media)' : ''}</option>\`).join('')}
               </select>
+              \${mediaHtml}
               <div class="msg-preview" id="preview-\${lead.id}">\${msg}</div>
             </td>
             <td style="text-align: center;">
-              <div class="action-group" style="justify-content: center;">
-                <a href="\${waLink}" target="_blank" onclick="markSent(\${lead.id})" class="btn-wa \${lead.isSent ? 'sent' : ''}">
+              <div class="action-group">
+                <a href="\${waLink}" target="_blank" onclick="handleSendClick(\${lead.id}, '\${tplObj.mediaUrl || ''}')" class="btn-wa \${lead.isSent ? 'sent' : ''}">
                   <span>\${lead.isSent ? 'Resend' : 'Send'}</span> 💬
                 </a>
+                \${tplObj.mediaUrl && tplObj.mediaType !== 'video' ? \`<span style="font-size: 10px; color: #666;">(Image copied on send)</span>\` : ''}
               </div>
             </td>
           </tr>
@@ -888,17 +1279,52 @@ app.get('/', (req, res) => {
       const lead = state.leads.find(l => l.id === leadId);
       if (!lead) return;
       lead.selectedTemplate = tplKey;
-
-      let msg = '';
-      if (tplKey === '__custom__' && lead.customMessage) {
-        msg = lead.customMessage;
-      } else {
-        msg = renderTemplate(state.templates[tplKey] || '', lead.variables);
-      }
-
-      const preview = document.getElementById('preview-' + leadId);
-      if (preview) preview.innerText = msg;
       renderTable();
+    }
+
+    async function handleSendClick(leadId, mediaUrl) {
+      markSent(leadId);
+      if (mediaUrl && !mediaUrl.match(/\\.(mp4|mov|webm)$/i)) {
+        await copyImageToClipboard(mediaUrl, false);
+        showToast('Image copied to clipboard! In WhatsApp Web, press Cmd+V (or Ctrl+V) to paste the image.');
+      }
+    }
+
+    async function copyImageToClipboard(imageUrl, showToastMsg = true) {
+      try {
+        const response = await fetch(imageUrl);
+        const blob = await response.blob();
+        
+        // Convert to PNG blob if JPEG (ClipboardItem requires image/png in some browsers)
+        let pngBlob = blob;
+        if (blob.type !== 'image/png') {
+          pngBlob = await convertBlobToPng(blob);
+        }
+
+        await navigator.clipboard.write([
+          new ClipboardItem({ 'image/png': pngBlob })
+        ]);
+        if (showToastMsg) showToast('Image copied to clipboard! Paste it into WhatsApp with Cmd+V / Ctrl+V.');
+      } catch (err) {
+        console.warn('Direct image clipboard copy failed:', err);
+        if (showToastMsg) showToast('Image link ready: ' + imageUrl);
+      }
+    }
+
+    function convertBlobToPng(blob) {
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => {
+          const canvas = document.createElement('canvas');
+          canvas.width = img.width;
+          canvas.height = img.height;
+          const ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0);
+          canvas.toBlob(b => resolve(b), 'image/png');
+        };
+        img.onerror = reject;
+        img.src = URL.createObjectURL(blob);
+      });
     }
 
     async function markSent(leadId) {
@@ -927,6 +1353,7 @@ app.get('/', (req, res) => {
       showToast('Sent statuses reset.');
     }
 
+    // Connect Sheet
     async function connectSheet() {
       const btn = document.getElementById('connectBtn');
       const input = document.getElementById('sheetUrlInput');
@@ -948,14 +1375,15 @@ app.get('/', (req, res) => {
         });
         const data = await res.json();
 
-        if (!res.ok || !data.success) {
-          throw new Error(data.error || 'Failed to connect sheet');
-        }
+        if (!res.ok || !data.success) throw new Error(data.error || 'Failed to connect sheet');
 
         state.sheetStatus = data.sheetStatus;
         state.leads = data.leads;
+        state.groups = data.groups;
         updateBadge();
+        renderGroupDropdown();
         updateStats();
+        applyTemplateToAll(false);
         renderTable();
         showToast(data.message);
       } catch (err) {
@@ -976,15 +1404,15 @@ app.get('/', (req, res) => {
       try {
         const res = await fetch('/api/sheet/sync', { method: 'POST' });
         const data = await res.json();
-
-        if (!res.ok || !data.success) {
-          throw new Error(data.error || 'Failed to sync');
-        }
+        if (!res.ok || !data.success) throw new Error(data.error || 'Failed to sync');
 
         state.sheetStatus = data.sheetStatus;
         state.leads = data.leads;
+        state.groups = data.groups;
         updateBadge();
+        renderGroupDropdown();
         updateStats();
+        applyTemplateToAll(false);
         renderTable();
         showToast(data.message);
       } catch (err) {
@@ -995,24 +1423,57 @@ app.get('/', (req, res) => {
       }
     }
 
-    // Modal & Templates
-    function openTemplatesModal() {
-      const container = document.getElementById('templateInputs');
-      const tagsContainer = document.getElementById('availableTags');
+    // --- MODAL: GROUP NUMBERS INSPECTOR ---
+    function openGroupModal() {
+      const modal = document.getElementById('groupModal');
+      const title = document.getElementById('groupModalTitle');
+      const body = document.getElementById('groupModalBody');
+      const groupLeads = getFilteredByGroup();
 
-      // Detect available columns from headers or leads
-      const headers = state.sheetStatus.headers || ['name', 'phone', 'orderId', 'status', 'time'];
-      tagsContainer.innerHTML = '<strong>Available tags:</strong> ' + headers.map(h =>
-        \`<span class="tag-pill" onclick="insertTag('{{\${h}}}')">{{\${h}}}</span>\`
-      ).join(' ');
-
-      container.innerHTML = Object.entries(state.templates).map(([key, val]) => \`
-        <div>
-          <label style="font-weight: 600; font-size: 13px; text-transform: uppercase;">\${key.replace('_', ' ')}</label>
-          <textarea id="tpl_\${key}">\${val}</textarea>
-        </div>
+      title.innerHTML = '👥 Group: <strong>' + state.selectedGroup + '</strong> (' + groupLeads.length + ' Contacts)';
+      body.innerHTML = groupLeads.map(l => \`
+        <tr>
+          <td><strong>\${l.name}</strong></td>
+          <td style="font-family: monospace; color: #008069;">\${cleanPhone(l.phone)}</td>
+          <td>\${l.isSent ? '<span style="color:#0E702A; font-weight:600;">Sent</span>' : '<span style="color:#64748B;">Pending</span>'}</td>
+        </tr>
       \`).join('');
 
+      modal.classList.add('open');
+    }
+
+    function closeGroupModal() {
+      document.getElementById('groupModal').classList.remove('open');
+    }
+
+    function copyGroupNumbers(separator) {
+      const groupLeads = getFilteredByGroup();
+      const numbers = groupLeads
+        .map(l => cleanPhone(l.phone))
+        .filter(p => p.length >= 7);
+
+      if (numbers.length === 0) {
+        alert('No valid phone numbers found in this group.');
+        return;
+      }
+
+      const text = numbers.join(separator === '\\n' ? '\\n' : ', ');
+      navigator.clipboard.writeText(text);
+      showToast('Copied ' + numbers.length + ' phone numbers to clipboard!');
+    }
+
+    // --- MODAL: TEMPLATE & MEDIA MANAGER ---
+    let editingTemplateKey = null;
+
+    function openTemplatesModal() {
+      renderTemplateEditorPicker();
+      renderAvailableTags();
+      const keys = Object.keys(state.templates);
+      if (keys.length > 0) {
+        loadTemplateIntoEditor(keys[0]);
+      } else {
+        createNewTemplateForm();
+      }
       document.getElementById('templatesModal').classList.add('open');
     }
 
@@ -1020,42 +1481,152 @@ app.get('/', (req, res) => {
       document.getElementById('templatesModal').classList.remove('open');
     }
 
-    function insertTag(tag) {
-      const active = document.activeElement;
-      if (active && active.tagName === 'TEXTAREA') {
-        const start = active.selectionStart;
-        const end = active.selectionEnd;
-        active.value = active.value.substring(0, start) + tag + active.value.substring(end);
-        active.selectionStart = active.selectionEnd = start + tag.length;
-        active.focus();
+    function renderTemplateEditorPicker() {
+      const picker = document.getElementById('editTplPicker');
+      picker.innerHTML = Object.entries(state.templates).map(([k, tpl]) => \`
+        <option value="\${k}">\${tpl.title} (\${k})\${tpl.mediaUrl ? ' 🖼️' : ''}</option>
+      \`).join('');
+    }
+
+    function renderAvailableTags() {
+      const container = document.getElementById('availableTags');
+      const headers = state.sheetStatus.headers || ['name', 'phone', 'group', 'orderId', 'status', 'time'];
+      container.innerHTML = '<span style="font-size: 11px; color:#555;">Click tag to insert:</span> ' + headers.map(h => \`
+        <span class="tag-pill" onclick="insertTagIntoText('{{\${h}}}')">{{\${h}}}</span>
+      \`).join(' ');
+    }
+
+    function insertTagIntoText(tag) {
+      const textarea = document.getElementById('tplTextInput');
+      const start = textarea.selectionStart;
+      const end = textarea.selectionEnd;
+      textarea.value = textarea.value.substring(0, start) + tag + textarea.value.substring(end);
+      textarea.selectionStart = textarea.selectionEnd = start + tag.length;
+      textarea.focus();
+    }
+
+    function loadTemplateIntoEditor(key) {
+      editingTemplateKey = key;
+      document.getElementById('editTplPicker').value = key;
+      const tpl = state.templates[key] || { title: '', text: '', mediaUrl: '', mediaType: '' };
+
+      document.getElementById('tplKeyInput').value = key;
+      document.getElementById('tplKeyInput').disabled = true; // don't change key on edit
+      document.getElementById('tplTitleInput').value = tpl.title || '';
+      document.getElementById('tplTextInput').value = tpl.text || '';
+      document.getElementById('tplMediaUrlInput').value = tpl.mediaUrl || '';
+      document.getElementById('deleteTplBtn').style.display = 'inline-flex';
+
+      updateMediaPreviewInEditor();
+    }
+
+    function createNewTemplateForm() {
+      editingTemplateKey = null;
+      document.getElementById('tplKeyInput').value = '';
+      document.getElementById('tplKeyInput').disabled = false;
+      document.getElementById('tplTitleInput').value = '';
+      document.getElementById('tplTextInput').value = '';
+      document.getElementById('tplMediaUrlInput').value = '';
+      document.getElementById('deleteTplBtn').style.display = 'none';
+      updateMediaPreviewInEditor();
+    }
+
+    function updateMediaPreviewInEditor() {
+      const url = document.getElementById('tplMediaUrlInput').value.trim();
+      const previewBox = document.getElementById('mediaEditorPreviewBox');
+      const content = document.getElementById('mediaEditorPreviewContent');
+
+      if (!url) {
+        previewBox.style.display = 'none';
+        content.innerHTML = '';
+        return;
+      }
+
+      previewBox.style.display = 'block';
+      const isVideo = url.match(/\\.(mp4|mov|webm)$/i);
+      if (isVideo) {
+        content.innerHTML = \`<video src="\${url}" controls style="max-width: 100%; max-height: 140px; border-radius: 6px;"></video>\`;
       } else {
-        navigator.clipboard.writeText(tag);
-        showToast('Copied ' + tag + ' to clipboard!');
+        content.innerHTML = \`<img src="\${url}" style="max-width: 100%; max-height: 140px; border-radius: 6px; object-fit: contain;" alt="Preview" />\`;
       }
     }
 
-    async function saveTemplates() {
-      const updated = {};
-      Object.keys(state.templates).forEach(key => {
-        const el = document.getElementById('tpl_' + key);
-        if (el) updated[key] = el.value;
-      });
+    async function uploadSelectedMedia() {
+      const fileInput = document.getElementById('mediaFileInput');
+      if (!fileInput.files || fileInput.files.length === 0) {
+        alert('Please choose a file to upload first.');
+        return;
+      }
+
+      const formData = new FormData();
+      formData.append('mediaFile', fileInput.files[0]);
 
       try {
-        const res = await fetch('/api/templates', {
+        showToast('Uploading media file...');
+        const res = await fetch('/api/upload-media', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ templates: updated })
+          body: formData
         });
         const data = await res.json();
-        if (data.success) {
-          state.templates = data.templates;
-          closeTemplatesModal();
-          renderTable();
-          showToast('Templates saved successfully!');
-        }
+        if (!data.success) throw new Error(data.error || 'Upload failed');
+
+        document.getElementById('tplMediaUrlInput').value = data.url;
+        updateMediaPreviewInEditor();
+        showToast('Media uploaded successfully!');
+      } catch (err) {
+        alert('Media upload failed: ' + err.message);
+      }
+    }
+
+    async function saveCurrentTemplate() {
+      const key = (document.getElementById('tplKeyInput').value || '').trim();
+      const title = (document.getElementById('tplTitleInput').value || '').trim();
+      const text = (document.getElementById('tplTextInput').value || '').trim();
+      const mediaUrl = (document.getElementById('tplMediaUrlInput').value || '').trim();
+
+      if (!key) {
+        alert('Please enter a Template Key.');
+        return;
+      }
+      if (!text) {
+        alert('Please enter Template Message Text.');
+        return;
+      }
+
+      try {
+        const res = await fetch('/api/templates/save-single', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ key, title, text, mediaUrl })
+        });
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error || 'Failed to save template');
+
+        state.templates = data.templates;
+        renderGlobalTemplateDropdown();
+        renderTemplateEditorPicker();
+        renderTable();
+        closeTemplatesModal();
+        showToast('Template saved successfully!');
       } catch (e) {
-        alert('Error saving templates: ' + e.message);
+        alert('Error: ' + e.message);
+      }
+    }
+
+    async function deleteCurrentTemplate() {
+      if (!editingTemplateKey) return;
+      if (!confirm('Are you sure you want to delete template "' + editingTemplateKey + '"?')) return;
+
+      try {
+        const res = await fetch('/api/templates/' + encodeURIComponent(editingTemplateKey), { method: 'DELETE' });
+        const data = await res.json();
+        state.templates = data.templates;
+        renderGlobalTemplateDropdown();
+        renderTable();
+        closeTemplatesModal();
+        showToast('Template deleted.');
+      } catch (e) {
+        alert('Delete failed: ' + e.message);
       }
     }
 
@@ -1066,7 +1637,9 @@ app.get('/', (req, res) => {
         const data = await res.json();
         state.sheetStatus = data.sheetStatus;
         state.leads = data.leads;
+        state.groups = data.groups || [];
         state.templates = data.templates;
+        state.globalTemplate = data.defaultTemplate || Object.keys(data.templates)[0] || 'welcome';
         state.defaultCountryCode = data.defaultCountryCode || '91';
 
         if (state.sheetStatus.sheetUrl) {
@@ -1074,7 +1647,10 @@ app.get('/', (req, res) => {
         }
 
         updateBadge();
+        renderGroupDropdown();
+        renderGlobalTemplateDropdown();
         updateStats();
+        applyTemplateToAll(false);
         renderTable();
       } catch (e) {
         console.error('Failed to load initial state', e);

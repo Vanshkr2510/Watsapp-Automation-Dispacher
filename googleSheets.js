@@ -79,6 +79,10 @@ function normalizeLeadRow(row, index) {
   const customMessage =
     findValue(['message', 'custommessage', 'customtext', 'text', 'notes', 'msg']);
 
+  const group =
+    findValue(['group', 'groups', 'tag', 'tags', 'category', 'categories', 'segment', 'batch', 'list', 'team']) ||
+    'General';
+
   // Build variables dictionary for any column in the sheet
   const variables = {};
   for (const [key, val] of Object.entries(row)) {
@@ -91,6 +95,7 @@ function normalizeLeadRow(row, index) {
   // Standard template variables shorthand
   variables['name'] = name;
   variables['phone'] = phone;
+  variables['group'] = group;
   variables['orderId'] = orderId;
   variables['status'] = status;
   variables['time'] = time;
@@ -99,6 +104,7 @@ function normalizeLeadRow(row, index) {
     id: index + 1,
     name,
     phone,
+    group,
     orderId,
     status,
     time,

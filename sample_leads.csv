@@ -1,7 +1,9 @@
-Name,Phone,OrderId,Status,Time,Template
-Rohit Sharma,+91 98765 43210,ORD-101,Out for delivery,3:00 PM,order_update
-Priya Singh,+91 91234 56789,ORD-102,Processing,5:30 PM,welcome
-Amit Patel,+91 99887 76655,ORD-103,Ready for pickup,11:00 AM,reminder
-Sneha Verma,+91 98111 22334,ORD-104,Delivered,2:15 PM,welcome
-Vikram Malhotra,+91 97654 32109,ORD-105,Dispatched,4:45 PM,order_update
-Ananya Roy,+91 98450 12345,ORD-106,Confirmed,10:00 AM,reminder
+Name,Phone,Group,OrderId,Status,Time,Template
+Rohit Sharma,+91 98765 43210,VIP,ORD-101,Out for delivery,3:00 PM,order_update
+Priya Singh,+91 91234 56789,New Leads,ORD-102,Processing,5:30 PM,welcome
+Amit Patel,+91 99887 76655,VIP,ORD-103,Ready for pickup,11:00 AM,reminder
+Sneha Verma,+91 98111 22334,Wholesale,ORD-104,Delivered,2:15 PM,welcome
+Vikram Malhotra,+91 97654 32109,New Leads,ORD-105,Dispatched,4:45 PM,order_update
+Ananya Roy,+91 98450 12345,VIP,ORD-106,Confirmed,10:00 AM,reminder
+Karan Johar,+91 98222 33445,Wholesale,ORD-107,In Transit,12:30 PM,order_update
+Pooja Hegde,+91 98333 44556,New Leads,ORD-108,Pending Payment,4:00 PM,welcome
