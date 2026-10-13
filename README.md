@@ -7,6 +7,7 @@ A fast, lightweight, and modern WhatsApp automation dashboard that connects dire
 ## 🚀 Features
 
 - **📊 Direct Google Sheets Integration**: Connect any Google Sheet in seconds by simply pasting its link. No complex Google Cloud credentials or OAuth required!
+- **🤖 Semi-Automation Auto-Draft Bot (Playwright)**: Launches persistent Google Chrome, navigates to each contact, and types the message into the box as an **unsent draft**. Strictly obeys the safety rule: **DOES NOT SEND OR HIT ENTER**. Syncs drafts across devices so you can tap Send manually!
 - **▲ Vercel Postgres & Cloud Storage**: Seamlessly connect Vercel Postgres (Neon) or Supabase. Permanently stores **only Name & Phone** (contacts), while message text and templates remain ephemeral in memory.
 - **⚡ Deploy to Vercel in 1-Click**: Pre-configured `vercel.json` to deploy your full dashboard to a free public Vercel URL.
 - **👥 Contact Groups (Audience Segments)**: Auto-detects a `Group` / `Tag` column from Google Sheets (e.g., `VIP`, `New Leads`, `Wholesale`). Filter contacts by group and inspect/copy all numbers in any group in one click!

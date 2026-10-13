@@ -16,12 +16,23 @@ const {
   resetSentStatusInDatabase,
   fetchContactsFromDatabase
 } = require('./dbClient');
+const { runDraftDispatcher } = require('./draft_dispatcher');
 
 const app = express();
 const PORT = process.env.PORT || 1212;
 const CONFIG_FILE = path.join(__dirname, 'config.json');
 const SAMPLE_CSV = path.join(__dirname, 'sample_leads.csv');
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
+
+let playwrightState = {
+  isRunning: false,
+  currentIndex: 0,
+  total: 0,
+  currentContact: '',
+  currentPhone: '',
+  status: 'idle',
+  history: []
+};
 
 if (!fs.existsSync(UPLOADS_DIR)) {
   fs.mkdirSync(UPLOADS_DIR, { recursive: true });
@@ -478,6 +489,75 @@ app.post('/api/leads/reset-sent', async (req, res) => {
   res.json({ success: true });
 });
 
+// --- Playwright Semi-Automation Draft Dispatcher API ---
+app.post('/api/playwright/start-drafts', async (req, res) => {
+  if (playwrightState.isRunning) {
+    return res.status(400).json({ error: 'A Playwright drafting session is already running.' });
+  }
+
+  const { group = 'All', templateKey, limit = 50, useExistingCdp = false, cdpUrl = 'http://localhost:9222' } = req.body;
+  const tpl = appConfig.templates[templateKey] || Object.values(appConfig.templates)[0];
+  const templateText = tpl ? tpl.text : 'Hi {{name}}!';
+
+  const groupLeads = group === 'All'
+    ? currentLeads
+    : currentLeads.filter(l => (l.group || 'General').toLowerCase() === group.toLowerCase());
+
+  const targetCount = Math.min(groupLeads.length, limit);
+  if (targetCount === 0) {
+    return res.status(400).json({ error: 'No contacts found for selected group.' });
+  }
+
+  playwrightState = {
+    isRunning: true,
+    currentIndex: 0,
+    total: targetCount,
+    currentContact: '',
+    currentPhone: '',
+    status: 'starting',
+    history: []
+  };
+
+  res.json({ success: true, message: 'Draft automation started in Chrome!', state: playwrightState });
+
+  // Run in background
+  runDraftDispatcher({
+    contacts: groupLeads,
+    templateText,
+    group,
+    limit,
+    useExistingCdp,
+    cdpUrl,
+    onProgress: (prog) => {
+      playwrightState.currentIndex = prog.index;
+      playwrightState.total = prog.total;
+      playwrightState.currentContact = prog.contact;
+      playwrightState.currentPhone = prog.phone;
+      playwrightState.status = prog.status;
+      playwrightState.history.unshift({
+        contact: prog.contact,
+        phone: prog.phone,
+        status: prog.status,
+        time: new Date().toLocaleTimeString()
+      });
+      const lead = currentLeads.find(l => cleanPhoneNumber(l.phone) === prog.phone);
+      if (lead) sentLeadIds.add(lead.id);
+    }
+  }).then(summary => {
+    playwrightState.isRunning = false;
+    playwrightState.status = 'completed';
+    playwrightState.summary = summary;
+  }).catch(err => {
+    playwrightState.isRunning = false;
+    playwrightState.status = 'error';
+    playwrightState.error = err.message;
+  });
+});
+
+app.get('/api/playwright/status', (req, res) => {
+  res.json(playwrightState);
+});
+
 // Download sample CSV
 app.get('/api/download-sample', (req, res) => {
   res.download(SAMPLE_CSV, 'sample_leads.csv');
@@ -881,6 +961,9 @@ app.get('/', (req, res) => {
         </div>
       </div>
       <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+        <button class="btn btn-primary btn-sm" onclick="openPlaywrightModal()" title="Auto-open chats and draft messages without sending">
+          <span>🤖</span> Auto-Draft (Playwright)
+        </button>
         <button class="btn btn-secondary btn-sm" id="dbBtn" onclick="openDatabaseModal()">
           <span id="dbIcon">☁️</span> <span id="dbStatusText">Cloud Database</span>
         </button>
@@ -1153,6 +1236,71 @@ app.get('/', (req, res) => {
             <button class="btn btn-secondary btn-sm" onclick="closeTemplatesModal()">Cancel</button>
             <button class="btn btn-primary btn-sm" onclick="saveCurrentTemplate()">💾 Save Template</button>
           </div>
+        </div>
+  <!-- MODAL: Playwright Semi-Automation Draft Bot -->
+  <div id="playwrightModal" class="modal-backdrop">
+    <div class="modal" style="max-width: 640px;">
+      <div class="modal-header">
+        <div class="modal-title">🤖 WhatsApp Auto-Draft Bot (Playwright)</div>
+        <button class="close-btn" onclick="closePlaywrightModal()">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div style="background: #FEF3C7; border: 1.5px solid #F59E0B; padding: 12px; border-radius: 8px; font-size: 13px; color: #92400E; margin-bottom: 14px; line-height: 1.5;">
+          <strong>🔒 Semi-Automation Safety Rule:</strong>
+          This bot opens each chat and types the text into the box as an <strong>unsent draft</strong>. It will <strong>NEVER press Enter or click Send</strong>. The drafts stay ready in your WhatsApp account so you can manually tap Send on your mobile phone or PC!
+        </div>
+
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px;">
+          <div>
+            <label style="font-size: 11px; font-weight: 700; text-transform: uppercase; color: #555;">Target Group</label>
+            <select id="pwGroupSelect" style="margin-top: 4px;"></select>
+          </div>
+          <div>
+            <label style="font-size: 11px; font-weight: 700; text-transform: uppercase; color: #555;">Template</label>
+            <select id="pwTemplateSelect" style="margin-top: 4px;"></select>
+          </div>
+        </div>
+
+        <div style="margin-bottom: 14px;">
+          <label style="font-size: 11px; font-weight: 700; text-transform: uppercase; color: #555;">Max Contacts</label>
+          <input type="number" id="pwLimitInput" value="50" min="1" max="200" style="margin-top: 4px; width: 120px; padding: 8px 10px; border: 1.5px solid #D1D7DB; border-radius: 6px;" />
+        </div>
+
+        <div style="background: #F8FAFC; border: 1px dashed #CBD5E1; padding: 12px; border-radius: 8px; font-size: 12px; margin-bottom: 16px;">
+          <label style="font-weight: 600;">Chrome Session Mode:</label>
+          <div style="margin-top: 6px; display: flex; flex-direction: column; gap: 6px;">
+            <label style="display: flex; align-items: flex-start; gap: 6px; cursor: pointer;">
+              <input type="radio" name="pwMode" value="profile" checked onchange="togglePwMode(this.value)" style="margin-top: 2px;" />
+              <span><strong>Persistent Dedicated Chrome Profile</strong><br/><span style="color: #666; font-size: 11px;">Opens Chrome with dedicated profile (./chrome-wa-profile). Scan QR once, stays logged in permanently.</span></span>
+            </label>
+            <label style="display: flex; align-items: flex-start; gap: 6px; cursor: pointer;">
+              <input type="radio" name="pwMode" value="cdp" onchange="togglePwMode(this.value)" style="margin-top: 2px;" />
+              <span><strong>Attach to Existing Chrome (Port 9222)</strong><br/><span style="color: #666; font-size: 11px;">Connects to Chrome already open on your desktop with remote debugging.</span></span>
+            </label>
+          </div>
+          <div id="pwCdpHint" style="display: none; margin-top: 8px; font-size: 11px; color: #334155; background: #E2E8F0; padding: 8px; border-radius: 6px;">
+            Run this in Terminal to launch Chrome with port 9222:<br/>
+            <code>/Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --remote-debugging-port=9222</code>
+          </div>
+        </div>
+
+        <!-- Live Progress Box -->
+        <div id="pwProgressBox" style="display: none; background: #F1F5F9; border: 1px solid #CBD5E1; padding: 14px; border-radius: 8px; margin-bottom: 14px;">
+          <div style="display: flex; justify-content: space-between; font-size: 12px; font-weight: 700; margin-bottom: 6px;">
+            <span id="pwStatusTitle">🤖 Initializing Chrome...</span>
+            <span id="pwCounter">0 / 0</span>
+          </div>
+          <div style="width: 100%; height: 8px; background: #E2E8F0; border-radius: 4px; overflow: hidden; margin-bottom: 10px;">
+            <div id="pwProgressBar" style="width: 0%; height: 100%; background: #25D366; transition: width 0.3s;"></div>
+          </div>
+          <div id="pwLiveLog" style="max-height: 130px; overflow-y: auto; font-family: monospace; font-size: 11px; color: #334155; line-height: 1.6; background: white; padding: 8px; border-radius: 6px; border: 1px solid #E2E8F0;"></div>
+        </div>
+
+        <div style="display: flex; justify-content: flex-end; gap: 8px;">
+          <button class="btn btn-secondary btn-sm" onclick="closePlaywrightModal()">Close</button>
+          <button class="btn btn-primary btn-sm" id="startPwBtn" onclick="startPlaywrightDrafting()">
+            🚀 Start Auto-Drafting (Safe: No Send)
+          </button>
         </div>
       </div>
     </div>
@@ -1865,6 +2013,100 @@ app.get('/', (req, res) => {
         showToast('Template deleted.');
       } catch (e) {
         alert('Delete failed: ' + e.message);
+      }
+    }
+
+    // --- Playwright Modal JS ---
+    let pwPollTimer = null;
+
+    function openPlaywrightModal() {
+      const grpSel = document.getElementById('pwGroupSelect');
+      grpSel.innerHTML = state.groups.map(g => \`<option value="\${g.name}">\${g.name} (\${g.count})</option>\`).join('');
+
+      const tplSel = document.getElementById('pwTemplateSelect');
+      tplSel.innerHTML = Object.entries(state.templates).map(([k, t]) => \`<option value="\${k}">\${t.title}</option>\`).join('');
+
+      document.getElementById('playwrightModal').classList.add('open');
+    }
+
+    function closePlaywrightModal() {
+      document.getElementById('playwrightModal').classList.remove('open');
+      if (pwPollTimer) clearInterval(pwPollTimer);
+    }
+
+    function togglePwMode(val) {
+      document.getElementById('pwCdpHint').style.display = val === 'cdp' ? 'block' : 'none';
+    }
+
+    async function startPlaywrightDrafting() {
+      const group = document.getElementById('pwGroupSelect').value;
+      const templateKey = document.getElementById('pwTemplateSelect').value;
+      const limit = parseInt(document.getElementById('pwLimitInput').value || '50', 10);
+      const useExistingCdp = document.querySelector('input[name="pwMode"]:checked').value === 'cdp';
+
+      const btn = document.getElementById('startPwBtn');
+      btn.disabled = true;
+      btn.innerText = 'Drafting in progress...';
+
+      document.getElementById('pwProgressBox').style.display = 'block';
+      document.getElementById('pwLiveLog').innerHTML = '<div style="color:#008069;">🚀 Starting Playwright Chrome session...</div>';
+
+      try {
+        const res = await fetch('/api/playwright/start-drafts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ group, templateKey, limit, useExistingCdp })
+        });
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error || 'Failed to start');
+
+        if (pwPollTimer) clearInterval(pwPollTimer);
+        pwPollTimer = setInterval(pollPlaywrightStatus, 1500);
+      } catch (err) {
+        alert('Could not start Playwright: ' + err.message);
+        btn.disabled = false;
+        btn.innerText = '🚀 Start Auto-Drafting (Safe: No Send)';
+      }
+    }
+
+    async function pollPlaywrightStatus() {
+      try {
+        const res = await fetch('/api/playwright/status');
+        const st = await res.json();
+
+        const title = document.getElementById('pwStatusTitle');
+        const counter = document.getElementById('pwCounter');
+        const bar = document.getElementById('pwProgressBar');
+        const log = document.getElementById('pwLiveLog');
+        const btn = document.getElementById('startPwBtn');
+
+        counter.innerText = st.currentIndex + ' / ' + st.total;
+        const pct = st.total > 0 ? Math.round((st.currentIndex / st.total) * 100) : 0;
+        bar.style.width = pct + '%';
+
+        if (st.isRunning) {
+          title.innerText = '🤖 Drafting: ' + (st.currentContact || 'Loading...');
+        } else if (st.status === 'completed') {
+          title.innerText = '✅ Completed! All drafts ready.';
+          btn.disabled = false;
+          btn.innerText = '🚀 Start Again';
+          clearInterval(pwPollTimer);
+          showToast('Drafting complete! Open WhatsApp on phone/PC and tap Send.');
+        } else if (st.status === 'error') {
+          title.innerText = '❌ Error: ' + (st.error || 'Unknown error');
+          btn.disabled = false;
+          btn.innerText = '🚀 Retry';
+          clearInterval(pwPollTimer);
+        }
+
+        if (st.history && st.history.length > 0) {
+          log.innerHTML = st.history.slice(0, 20).map(h => {
+            const icon = h.status === 'drafted' ? '✅' : (h.status === 'processing' ? '⏳' : '⚠️');
+            return '<div>' + icon + ' [' + h.time + '] ' + h.contact + ' (' + h.phone + '): ' + h.status + '</div>';
+          }).join('');
+        }
+      } catch (e) {
+        console.warn('Poll error:', e);
       }
     }
 
