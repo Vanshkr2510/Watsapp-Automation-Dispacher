@@ -1,0 +1,9 @@
+{
+  "sheetUrl": "",
+  "defaultCountryCode": "91",
+  "templates": {
+    "welcome": "Hi {{name}}! Welcome to our service. How can we help you today?",
+    "order_update": "Hello {{name}}, your order #{{orderId}} is currently {{status}}.",
+    "reminder": "Hi {{name}}, friendly reminder about our scheduled call/appointment at {{time}}."
+  }
+}
